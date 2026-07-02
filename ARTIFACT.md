@@ -1,6 +1,6 @@
 # OrbitLLM Artifact Guide
 
-This artifact contains the code and data needed to reproduce the OrbitLLM workshop results.
+This artifact contains the code needed to reproduce the OrbitLLM workshop experiments. The paper text and LaTeX sources are intentionally not included in the public code repository.
 
 ## Code Layout
 
@@ -14,14 +14,7 @@ This artifact contains the code and data needed to reproduce the OrbitLLM worksh
 
 ## Result Layout
 
-- `results/profile_remote_fp16.csv`, `results/profile_remote_int8.csv`, `results/profile_remote_int4.csv`: remote RTX 4090 benchmark outputs.
-- `results/profile_anchor.csv`: aggregated measured 4090 profile used by the simulator.
-- `results/simulation_metrics.csv`: main 24-hour experiment.
-- `results/network_sensitivity_metrics.csv`: downlink/contact sweep.
-- `results/pre_sensitivity_metrics.csv`: PRE retention/utility sweep.
-- `results/hardware_sensitivity_metrics.csv`: hardware-profile scaling sweep.
-- `results/generated_tables.tex`: paper table macros.
-- `figures/*.png`: generated paper figures.
+Generated CSV results and figures are produced locally by the commands below. They are not required to be committed to the public code repository.
 
 ## Reproduce
 
@@ -49,12 +42,6 @@ Regenerate figures and tables:
 python -m orbitllm.cli plot
 ```
 
-Build the paper:
-
-```bash
-latexmk -pdf main.tex
-```
-
 ## Open-Source Notes
 
-The source code, configuration files, generated CSV results, and plotting scripts can be released publicly. Large model weights are not redistributed; users should download them from the original Qwen model repositories and place them in their own model directory.
+The source code, configuration files, tests, and plotting scripts can be released publicly. Large model weights are not redistributed; users should download them from the original Qwen model repositories and place them in their own model directory.
