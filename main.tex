@@ -1,0 +1,55 @@
+\documentclass[sigconf,10pt,nonacm]{acmart}
+
+% MobiArch 2026 asks for the ACM template, 10pt, two columns, US Letter.
+% The nonacm option removes ACM rights metadata for the submission draft.
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\usepackage{amsmath}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{subcaption}
+\usepackage{siunitx}
+\usepackage[ruled,vlined]{algorithm2e}
+\usepackage{enumitem}
+\usepackage[capitalize]{cleveref}
+
+\setlist{leftmargin=*,itemsep=0.12em,topsep=0.2em}
+\sisetup{detect-all}
+
+\title{OrbitLLM: Profile-Anchored Large-Model Scheduling for LEO/NTN Mobile Edge Systems}
+
+\author{Anonymous Author(s)}
+\affiliation{%
+  \institution{Affiliation}
+  \city{City}
+  \country{Country}}
+\email{email@domain}
+
+\begin{document}
+\input{results/generated_tables}
+
+\begin{abstract}
+\input{sections/abstract}
+\end{abstract}
+
+\keywords{LEO/NTN edge computing, large language models, on-board inference, energy-aware offloading, KV cache}
+
+\maketitle
+
+\input{sections/introduction}
+\input{sections/related}
+\input{sections/system_model}
+\input{sections/benchmark}
+\input{sections/policy}
+\input{sections/experiments}
+\input{sections/discussion}
+
+\bibliographystyle{ACM-Reference-Format}
+{\footnotesize
+\bibliography{refs}
+}
+
+\end{document}
