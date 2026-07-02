@@ -1,0 +1,16 @@
+\section{Introduction}
+\label{sec:intro}
+
+LEO satellites are becoming part of the mobile Internet architecture rather than isolated space relays. In emerging 6G non-terrestrial networks (NTNs), satellites may serve remote sensors, direct-to-device links, and delay-sensitive mobile services during intermittent contacts. At the same time, sensing pipelines are moving from narrow convolutional models toward large language and vision--language models~\cite{huo2025when,weng2025visionlanguage,mai2024opportunities}. The natural next step is to process high-value observations at the orbital edge instead of always waiting for a ground-station pass.
+
+The scheduling literature is not yet ready for this step. Most satellite-edge offloading formulations model a task by its input bits, CPU cycles, or service delay~\cite{li2025delaycost,zhao2025region,gao2024hierarchical}. That view misses two facts that dominate LLM inference. First, peak memory grows with context through the KV cache; a schedule that ignores this boundary can select an on-board action that simply does not fit. Second, prefill and decode tokens have different energy and throughput behavior because the former is compute-heavy and the latter is memory-bandwidth-heavy~\cite{li2024survey,kim2025oaken}. A scheduler that collapses them into one average cost misprices long generations, exactly the case expected in open-ended Earth-observation reports.
+
+This paper develops OrbitLLM as a workshop-scale scheduling layer for LEO/NTN mobile edge systems. We do not attempt to reproduce a full orbital hardware campaign. Instead, we build a measured LLM cost surface from RTX 4090 availability-anchor profiles and study how such a replaceable profile changes the on-board/downlink decision. Each task has a data size, required model scale, and exponentially decaying value. The policy selects one of three architecture actions: run the model on board, downlink the raw data for ground inference, or run a lightweight semantic pre-screen and downlink only retained evidence.
+
+Our contributions are:
+\begin{itemize}
+  \item \textbf{LLM-aware cost model.} We expose prefill energy, decode energy, throughput, and peak memory as explicit functions of model scale, quantization, and context length.
+  \item \textbf{Energy--value formulation.} We combine the LLM cost surface with orbital visibility windows, battery limits, downlink capacity, and time-decaying task values.
+  \item \textbf{Lightweight scheduler.} We give a MILP upper bound and a deployable heuristic, Heuristic-TVD, that greedily maximizes value density while enforcing hard energy and memory feasibility.
+  \item \textbf{Reproducible simulation.} We release a Python pipeline that generates task traces, runs baselines, performs network/PRE/hardware sweeps, writes CSV results, and regenerates every plot and table.
+\end{itemize}
