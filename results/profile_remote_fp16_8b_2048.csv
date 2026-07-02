@@ -1,0 +1,4 @@
+model,scale_b,quant,context_len,prefill_tokens,decode_tokens,prefill_j_per_tok,decode_j_per_tok,tokens_per_sec,peak_mem_gb,gpu_power_w,seed,run_id
+/root/autodl-tmp/models/Qwen3-8B,8.0,FP16,2048,2048,128,0.01251094,7.05316116,31.0222,17.0027,218.805,0,remote_4090_1782891443
+/root/autodl-tmp/models/Qwen3-8B,8.0,FP16,2048,2048,128,0.02348047,7.586426,31.5582,17.0027,239.414,1,remote_4090_1782891448
+/root/autodl-tmp/models/Qwen3-8B,8.0,FP16,2048,2048,128,0.02297394,7.57147477,32.2088,17.0027,243.868,2,remote_4090_1782891452
