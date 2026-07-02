@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import copy
 import math
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.request import urlopen
 
 import numpy as np
 import pandas as pd
@@ -71,6 +73,105 @@ def generate_windows(cfg: dict[str, Any], horizon_h: float | None = None) -> lis
         start += period_s
         idx += 1
     return windows
+
+
+def _parse_utc(value: str) -> datetime:
+    if value.endswith("Z"):
+        value = value[:-1] + "+00:00"
+    dt = datetime.fromisoformat(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def load_tle_lines(cfg: dict[str, Any]) -> tuple[str, str, str]:
+    tle_cfg = cfg.get("tle", {})
+    cache = resolve_project_path(tle_cfg.get("cache_path", "results/tle_landsat8.txt"))
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    if cache.exists() and cache.stat().st_size > 0:
+        text = cache.read_text(encoding="utf-8")
+    else:
+        url = tle_cfg["tle_url"]
+        text = urlopen(url, timeout=30).read().decode("utf-8", "replace")
+        cache.write_text(text, encoding="utf-8")
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 3 or not lines[1].startswith("1 ") or not lines[2].startswith("2 "):
+        raise ValueError(f"invalid TLE content in {cache}")
+    return lines[0], lines[1], lines[2]
+
+
+def generate_tle_windows(cfg: dict[str, Any], horizon_h: float | None = None) -> tuple[list[Window], pd.DataFrame]:
+    """Generate satellite-ground contact windows from public TLE data.
+
+    The resulting windows are geometry-driven contact opportunities. Link rates
+    remain a simple elevation-scaled model; the trace is not a traffic trace.
+    """
+
+    from skyfield.api import EarthSatellite, load, wgs84
+
+    tle_cfg = cfg.get("tle", {})
+    horizon_s = (horizon_h if horizon_h is not None else cfg["horizon_h"]) * 3600.0
+    step_s = int(tle_cfg.get("step_s", 20))
+    min_el = float(tle_cfg.get("min_elevation_deg", 10.0))
+    base_rate = float(cfg["orbit"]["downlink_rate_mbps"]) * 1e6
+    name, line1, line2 = load_tle_lines(cfg)
+    ts = load.timescale()
+    start = _parse_utc(tle_cfg.get("start_utc", "2026-07-02T00:00:00Z"))
+    offsets = np.arange(0.0, horizon_s + step_s, step_s)
+    datetimes = [start + timedelta(seconds=float(s)) for s in offsets]
+    times = ts.from_datetimes(datetimes)
+    sat = EarthSatellite(line1, line2, name, ts)
+
+    max_el = np.full(len(offsets), -90.0)
+    best_station = np.array(["" for _ in offsets], dtype=object)
+    for station in tle_cfg.get("ground_stations", []):
+        site = wgs84.latlon(float(station["lat_deg"]), float(station["lon_deg"]), elevation_m=float(station.get("elevation_m", 0.0)))
+        alt, _, _ = (sat - site).at(times).altaz()
+        el = alt.degrees
+        better = el > max_el
+        max_el[better] = el[better]
+        best_station[better] = str(station["name"])
+
+    visible = max_el >= min_el
+    rows: list[dict[str, float | str | int]] = []
+    windows: list[Window] = []
+    contact_id = 0
+    i = 0
+    while i < len(offsets) - 1:
+        if not visible[i]:
+            i += 1
+            continue
+        start_idx = i
+        rates: list[float] = []
+        stations: list[str] = []
+        while i < len(offsets) - 1 and visible[i]:
+            elevation_factor = 0.35 + 0.65 * min(max((max_el[i] - min_el) / max(90.0 - min_el, 1.0), 0.0), 1.0)
+            rates.append(base_rate * elevation_factor)
+            stations.append(str(best_station[i]))
+            i += 1
+        end_idx = i
+        start_s = float(offsets[start_idx])
+        end_s = float(offsets[end_idx])
+        if end_s <= start_s:
+            continue
+        rate_bps = float(np.mean(rates)) if rates else base_rate
+        windows.append(Window(start_s, end_s, rate_bps))
+        station = max(set(stations), key=stations.count) if stations else ""
+        rows.append(
+            {
+                "contact_id": contact_id,
+                "satellite": name,
+                "station": station,
+                "start_s": start_s,
+                "end_s": end_s,
+                "duration_s": end_s - start_s,
+                "mean_rate_mbps": rate_bps / 1e6,
+                "capacity_mbit": (end_s - start_s) * rate_bps / 1e6,
+                "max_elevation_deg": float(np.max(max_el[start_idx:end_idx])),
+            }
+        )
+        contact_id += 1
+    return windows, pd.DataFrame(rows)
 
 
 def generate_tasks(cfg: dict[str, Any], seed: int, horizon_h: float | None = None, limit: int | None = None) -> list[Task]:
@@ -621,10 +722,39 @@ def run_hardware_sensitivity(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.D
     return _normalize_by_group(pd.DataFrame(rows), ["seed", "energy_scale", "latency_scale"])
 
 
+def run_tle_realism(cfg: dict[str, Any], profile: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows: list[dict[str, float | str | int]] = []
+    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Heuristic-TVD"]
+    fixed_windows = generate_windows(cfg)
+    tle_windows, contact_df = generate_tle_windows(cfg)
+    models = [
+        ("fixed-window", fixed_windows),
+        ("tle-derived", tle_windows),
+    ]
+    for seed in cfg["seeds"]:
+        tasks = generate_tasks(cfg, int(seed))
+        for contact_model, windows in models:
+            capacity_gbit = sum(w.capacity_bits for w in windows) / 1e9
+            for policy in policies:
+                metrics, _ = run_policy(policy, tasks, windows, profile, cfg)
+                metrics.update(
+                    {
+                        "seed": seed,
+                        "contact_model": contact_model,
+                        "window_count": len(windows),
+                        "capacity_gbit": capacity_gbit,
+                    }
+                )
+                rows.append(metrics)
+    df = _normalize_by_group(pd.DataFrame(rows), ["seed", "contact_model"])
+    return df, contact_df
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run OrbitLLM scheduling simulation.")
     parser.add_argument("--config", default=None)
     parser.add_argument("--profile", default=None)
+    parser.add_argument("--only-tle", action="store_true", help="Run only the fixed-window vs. TLE-derived contact trace check.")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -633,18 +763,27 @@ def main(argv: list[str] | None = None) -> int:
     if not resolve_project_path(profile_path).exists():
         write_default_profile(profile_path)
     profile = load_profile(profile_path)
-    metrics, timeseries, ablation, sensitivity = run_experiment(cfg, profile)
-    network = run_network_sensitivity(cfg, profile)
-    pre = run_pre_sensitivity(cfg, profile)
-    hardware = run_hardware_sensitivity(cfg, profile)
-    metrics.to_csv(resolve_project_path(cfg["metrics_path"]), index=False)
-    timeseries.to_csv(resolve_project_path(cfg["timeseries_path"]), index=False)
-    ablation.to_csv(resolve_project_path(cfg["ablation_path"]), index=False)
-    sensitivity.to_csv(resolve_project_path(cfg["sensitivity_path"]), index=False)
-    network.to_csv(resolve_project_path(cfg.get("network_sensitivity_path", "results/network_sensitivity_metrics.csv")), index=False)
-    pre.to_csv(resolve_project_path(cfg.get("pre_sensitivity_path", "results/pre_sensitivity_metrics.csv")), index=False)
-    hardware.to_csv(resolve_project_path(cfg.get("hardware_sensitivity_path", "results/hardware_sensitivity_metrics.csv")), index=False)
-    print(f"wrote {cfg['metrics_path']}, {cfg['timeseries_path']}, {cfg['ablation_path']}, {cfg['sensitivity_path']}")
+    if getattr(args, "only_tle", False):
+        tle, contacts = run_tle_realism(cfg, profile)
+        tle.to_csv(resolve_project_path(cfg.get("tle_realism_path", "results/tle_realism_metrics.csv")), index=False)
+        contacts.to_csv(resolve_project_path(cfg.get("tle_contact_path", "results/tle_contact_trace.csv")), index=False)
+        print(f"wrote {cfg.get('tle_realism_path', 'results/tle_realism_metrics.csv')}, {cfg.get('tle_contact_path', 'results/tle_contact_trace.csv')}")
+    else:
+        metrics, timeseries, ablation, sensitivity = run_experiment(cfg, profile)
+        network = run_network_sensitivity(cfg, profile)
+        pre = run_pre_sensitivity(cfg, profile)
+        hardware = run_hardware_sensitivity(cfg, profile)
+        tle, contacts = run_tle_realism(cfg, profile)
+        metrics.to_csv(resolve_project_path(cfg["metrics_path"]), index=False)
+        timeseries.to_csv(resolve_project_path(cfg["timeseries_path"]), index=False)
+        ablation.to_csv(resolve_project_path(cfg["ablation_path"]), index=False)
+        sensitivity.to_csv(resolve_project_path(cfg["sensitivity_path"]), index=False)
+        network.to_csv(resolve_project_path(cfg.get("network_sensitivity_path", "results/network_sensitivity_metrics.csv")), index=False)
+        pre.to_csv(resolve_project_path(cfg.get("pre_sensitivity_path", "results/pre_sensitivity_metrics.csv")), index=False)
+        hardware.to_csv(resolve_project_path(cfg.get("hardware_sensitivity_path", "results/hardware_sensitivity_metrics.csv")), index=False)
+        tle.to_csv(resolve_project_path(cfg.get("tle_realism_path", "results/tle_realism_metrics.csv")), index=False)
+        contacts.to_csv(resolve_project_path(cfg.get("tle_contact_path", "results/tle_contact_trace.csv")), index=False)
+        print(f"wrote {cfg['metrics_path']}, {cfg['timeseries_path']}, {cfg['ablation_path']}, {cfg['sensitivity_path']}")
     return 0
 
 
