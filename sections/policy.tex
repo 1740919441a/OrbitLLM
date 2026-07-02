@@ -1,0 +1,35 @@
+\section{Scheduling Algorithms}
+\label{sec:policy}
+
+\subsection{MILP Upper Bound}
+With full knowledge of arrivals and windows, \cref{eq:obj}--\cref{eq:c-mem} can be solved as a mixed-integer linear program. We introduce binary variables $y_i^a$ for action $a\in\{\textsc{on},\textsc{down},\textsc{pre}\}$ and impose $\sum_a y_i^a=1$. The energy constraint is global, the bandwidth constraint is per visibility window, and infeasible memory choices receive zero eligibility. The MILP is solved only offline on the ground and gives an upper bound for causal policies.
+
+\subsection{Heuristic-TVD}
+The deployable policy is a constant-time value-density rule. For every arriving task, it computes the feasible completion time and realized value for each action. Let $V_i(a)$ be the realized value of action $a$ and let $V_i(\textsc{down})$ be the direct-downlink reference. We score each feasible action by
+\begin{equation}
+\mathrm{TVD}_i(a)=
+\frac{V_i(a)+\beta\max(0,V_i(a)-V_i(\textsc{down}))}
+{\epsilon+\lambda_E E_i(a)/\max(E_{\mathrm{res}},1)+\lambda_B b_i(a)/d_i}.
+\label{eq:tvd}
+\end{equation}
+The numerator rewards both absolute value and value recovered relative to waiting for downlink; the denominator penalizes scarce energy and bandwidth. Actions violating memory or residual energy are removed before scoring.
+
+\begin{algorithm}[tb]
+\small
+\caption{Heuristic-TVD Online Scheduling}
+\label{alg:policy}
+\KwIn{tasks, visibility windows, energy budget $E^{\max}$, memory ceiling $M^{\max}$, LLM profile $\Theta$}
+\KwOut{action $x_i$ for each task}
+$E_{\mathrm{res}}\leftarrow E^{\max}$; initialize downlink queue\;
+\For{each task $i$ in arrival order}{
+  read $(e^p,e^d,\mathrm{tok/s},\mathrm{peakmem})$ from $\Theta$\;
+  enumerate $a\in\{\textsc{on},\textsc{down},\textsc{pre}\}$\;
+  remove actions that exceed $E_{\mathrm{res}}$ or $M^{\max}$\;
+  estimate completion time, value, energy, and bits for each remaining action\;
+  $x_i\leftarrow\arg\max_a \mathrm{TVD}_i(a)$\;
+  commit compute energy and downlink bits for $x_i$\;
+}
+\end{algorithm}
+
+\subsection{Baselines}
+We compare against \textsc{All-Downlink}, which queues every raw observation for ground inference; \textsc{All-On-Board}, which runs on board until energy or memory prevents it; and \textsc{Fixed-Threshold}, which uses a static value threshold to decide whether to process or pre-screen on board. These baselines isolate the benefit of using time decay, LLM cost, and residual resources jointly.
