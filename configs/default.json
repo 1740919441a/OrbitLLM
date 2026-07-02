@@ -9,12 +9,27 @@
   "network_sensitivity_path": "results/network_sensitivity_metrics.csv",
   "pre_sensitivity_path": "results/pre_sensitivity_metrics.csv",
   "hardware_sensitivity_path": "results/hardware_sensitivity_metrics.csv",
+  "tle_contact_path": "results/tle_contact_trace.csv",
+  "tle_realism_path": "results/tle_realism_metrics.csv",
   "horizon_h": 24,
   "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
   "orbit": {
     "period_min": 90,
     "visible_min": 10,
     "downlink_rate_mbps": 35
+  },
+  "tle": {
+    "enabled": true,
+    "tle_url": "https://celestrak.org/NORAD/elements/gp.php?CATNR=39084&FORMAT=TLE",
+    "cache_path": "results/tle_landsat8.txt",
+    "start_utc": "2026-07-02T00:00:00Z",
+    "step_s": 20,
+    "min_elevation_deg": 10,
+    "ground_stations": [
+      {"name": "Austin", "lat_deg": 30.2672, "lon_deg": -97.7431, "elevation_m": 150},
+      {"name": "Fairbanks", "lat_deg": 64.8378, "lon_deg": -147.7164, "elevation_m": 136},
+      {"name": "Svalbard", "lat_deg": 78.2298, "lon_deg": 15.4078, "elevation_m": 458}
+    ]
   },
   "satellite": {
     "energy_budget_j": 150000,
