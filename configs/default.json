@@ -1,0 +1,57 @@
+{
+  "output_dir": "results",
+  "figures_dir": "figures",
+  "profile_path": "results/profile_anchor.csv",
+  "metrics_path": "results/simulation_metrics.csv",
+  "timeseries_path": "results/value_timeseries.csv",
+  "ablation_path": "results/ablation_metrics.csv",
+  "sensitivity_path": "results/sensitivity_metrics.csv",
+  "network_sensitivity_path": "results/network_sensitivity_metrics.csv",
+  "pre_sensitivity_path": "results/pre_sensitivity_metrics.csv",
+  "hardware_sensitivity_path": "results/hardware_sensitivity_metrics.csv",
+  "horizon_h": 24,
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "orbit": {
+    "period_min": 90,
+    "visible_min": 10,
+    "downlink_rate_mbps": 35
+  },
+  "satellite": {
+    "energy_budget_j": 150000,
+    "memory_gb": 16,
+    "quant": "INT4",
+    "pre_energy_fraction": 0.18,
+    "pre_latency_fraction": 0.18,
+    "pre_retention_fraction": 0.32,
+    "pre_value_fraction": 0.94
+  },
+  "tasks": {
+    "count_per_24h": 260,
+    "scale_choices_b": [1.7, 3, 8],
+    "scale_prob": [0.38, 0.42, 0.20],
+    "data_mb_lognormal_mean": 4.0,
+    "data_mb_lognormal_sigma": 0.7,
+    "urgent_fraction": 0.36,
+    "urgent_half_life_min": [8, 30],
+    "routine_half_life_min": [90, 360],
+    "value_range": [8, 25],
+    "prefill_tokens": [384, 768, 1536],
+    "decode_tokens": [96, 160, 256],
+    "fixed_threshold": 18.0
+  },
+  "milp": {
+    "max_tasks": 120,
+    "timeout_s": 30
+  },
+  "benchmark": {
+    "models": [
+      {"model": "Qwen/Qwen3-1.7B", "scale_b": 1.7},
+      {"model": "Qwen/Qwen2.5-3B-Instruct", "scale_b": 3.0},
+      {"model": "Qwen/Qwen3-8B", "scale_b": 8.0}
+    ],
+    "quants": ["FP16", "INT8", "INT4"],
+    "context_lengths": [512, 1024, 2048, 4096],
+    "decode_tokens": 128,
+    "runs": 3
+  }
+}
