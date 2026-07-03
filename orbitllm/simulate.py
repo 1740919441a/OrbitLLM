@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 import copy
+import itertools
 import math
+import time
 from datetime import datetime, timedelta, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.request import urlopen
@@ -307,10 +309,16 @@ def choose_heuristic(
     cfg: dict[str, Any],
     allow_pre: bool = True,
     split_energy: bool = True,
+    hard_energy: bool = True,
 ) -> str:
     sat = cfg["satellite"]
     energy_budget = sat["energy_budget_j"]
     memory_limit = sat["memory_gb"]
+    heur = cfg.get("heuristic", {})
+    beta = float(heur.get("beta", 0.35))
+    lambda_energy = float(heur.get("lambda_energy", 4.0))
+    lambda_bandwidth = float(heur.get("lambda_bandwidth", 0.45))
+    epsilon = float(heur.get("epsilon", 0.015))
     candidates: list[tuple[float, str]] = []
     down_completion = scheduler.clone().schedule(task.arrival_s, costs["DOWN"].bits, commit=True)
     down_value = value_at(task, down_completion)
@@ -318,7 +326,7 @@ def choose_heuristic(
     for action in action_names:
         cost = costs[action]
         if action in {"ON", "PRE"}:
-            if cost.memory_gb > memory_limit or cost.energy_j > energy_left:
+            if cost.memory_gb > memory_limit or (hard_energy and cost.energy_j > energy_left):
                 continue
             completion = max(task.arrival_s, compute_ready_s) + cost.latency_s
             if action == "PRE":
@@ -330,7 +338,7 @@ def choose_heuristic(
         residual_scale = max(min(energy_left, energy_budget), 1.0)
         energy_norm = cost.energy_j / residual_scale
         bw_norm = cost.bits / max(task.data_bits, 1.0)
-        density = (realized + 0.35 * saved) / (0.015 + 4.0 * energy_norm + 0.45 * bw_norm)
+        density = (realized + beta * saved) / (epsilon + lambda_energy * energy_norm + lambda_bandwidth * bw_norm)
         candidates.append((density, action))
     if not candidates:
         return "DOWN"
@@ -350,6 +358,206 @@ def choose_fixed_threshold(
     return "DOWN"
 
 
+def choose_priority_aware(
+    task: Task,
+    costs: dict[str, ActionCost],
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> str:
+    priority = task.value0 / max(task.half_life_s / 60.0, 1e-6)
+    task_cfg = cfg["tasks"]
+    if (
+        priority >= float(task_cfg.get("priority_on_threshold", 0.55))
+        and costs["ON"].memory_gb <= cfg["satellite"]["memory_gb"]
+        and costs["ON"].energy_j <= energy_left
+    ):
+        return "ON"
+    if priority >= float(task_cfg.get("priority_pre_threshold", 0.18)) and costs["PRE"].energy_j <= energy_left:
+        return "PRE"
+    return "DOWN"
+
+
+def choose_min_latency(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> str:
+    candidates: list[tuple[float, str]] = []
+    # Traditional delay-minimizing offloading baselines choose between local
+    # compute and cloud/ground offload. We intentionally exclude PRE here
+    # because PRE is the semantic middle action introduced by OrbitLLM.
+    for action in ["ON", "DOWN"]:
+        cost = costs[action]
+        if action in {"ON", "PRE"}:
+            if cost.memory_gb > cfg["satellite"]["memory_gb"] or cost.energy_j > energy_left:
+                continue
+            completion = max(task.arrival_s, compute_ready_s) + cost.latency_s
+            if action == "PRE":
+                completion = scheduler.clone().schedule(completion, cost.bits, commit=True)
+        else:
+            completion = scheduler.clone().schedule(task.arrival_s, cost.bits, commit=True)
+        candidates.append((completion, action))
+    if not candidates:
+        return "DOWN"
+    return min(candidates)[1]
+
+
+def choose_deadline_energy(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> str:
+    deadline_s = task.arrival_s + task.half_life_s
+    feasible_by_deadline: list[tuple[float, float, str]] = []
+    fallback: list[tuple[float, str]] = []
+    for action in ["ON", "PRE", "DOWN"]:
+        cost = costs[action]
+        if action in {"ON", "PRE"}:
+            if cost.memory_gb > cfg["satellite"]["memory_gb"] or cost.energy_j > energy_left:
+                continue
+            completion = max(task.arrival_s, compute_ready_s) + cost.latency_s
+            if action == "PRE":
+                completion = scheduler.clone().schedule(completion, cost.bits, commit=True)
+        else:
+            completion = scheduler.clone().schedule(task.arrival_s, cost.bits, commit=True)
+        fallback.append((completion, action))
+        if completion <= deadline_s:
+            # Prefer low compute energy, then low transmitted bits.
+            feasible_by_deadline.append((cost.energy_j, cost.bits, action))
+    if feasible_by_deadline:
+        return min(feasible_by_deadline)[2]
+    if fallback:
+        return min(fallback)[1]
+    return "DOWN"
+
+
+def choose_energy_wsrpt(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> str:
+    """Energy-aware WSRPT-style online index baseline.
+
+    The baseline favors short remaining service time per unit current value,
+    then adds explicit energy and bandwidth prices. It is intentionally simpler
+    than TVD: it does not use value recovered relative to downlink.
+    """
+    sat = cfg["satellite"]
+    params = cfg.get("wsrpt", {})
+    alpha_energy = float(params.get("alpha_energy", 1.0))
+    alpha_bandwidth = float(params.get("alpha_bandwidth", 0.15))
+    value_floor = float(params.get("value_floor", 1e-3))
+    candidates: list[tuple[float, str]] = []
+    for action in ["ON", "PRE", "DOWN"]:
+        cost = costs[action]
+        if action in {"ON", "PRE"}:
+            if cost.memory_gb > sat["memory_gb"] or cost.energy_j > energy_left:
+                continue
+            ready = max(task.arrival_s, compute_ready_s)
+            completion = ready + cost.latency_s
+            if action == "PRE":
+                completion = scheduler.clone().schedule(completion, cost.bits, commit=True)
+        else:
+            completion = scheduler.clone().schedule(task.arrival_s, cost.bits, commit=True)
+        service_s = max(0.0, completion - task.arrival_s)
+        current_value = max(value_at(task, max(task.arrival_s, compute_ready_s)) * cost.value_factor, value_floor)
+        energy_price = cost.energy_j / max(energy_left, 1.0)
+        bandwidth_price = cost.bits / max(task.data_bits, 1.0)
+        score = service_s / current_value + alpha_energy * energy_price + alpha_bandwidth * bandwidth_price
+        candidates.append((score, action))
+    if not candidates:
+        return "DOWN"
+    return min(candidates)[1]
+
+
+def solar_recharge_j(cfg: dict[str, Any], start_s: float, end_s: float) -> float:
+    soc = cfg.get("soc", {})
+    if end_s <= start_s:
+        return 0.0
+    sunlight_s = float(soc.get("sunlight_min", 58.0)) * 60.0
+    eclipse_s = float(soc.get("eclipse_min", 32.0)) * 60.0
+    period_s = max(sunlight_s + eclipse_s, 1.0)
+    charge_w = float(soc.get("charge_power_w", 35.0))
+    step_s = 60.0
+    energy = 0.0
+    t = start_s
+    while t < end_s:
+        dt = min(step_s, end_s - t)
+        phase = t % period_s
+        if phase < sunlight_s:
+            energy += charge_w * dt
+        t += dt
+    return energy
+
+
+def _simulate_action_sequence(
+    actions: tuple[str, ...],
+    tasks: list[Task],
+    windows: list[Window],
+    profile: pd.DataFrame,
+    cfg: dict[str, Any],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+) -> float:
+    sim_scheduler = scheduler.clone()
+    sim_compute_ready = compute_ready_s
+    sim_energy_left = energy_left
+    value = 0.0
+    memory_limit = float(cfg["satellite"]["memory_gb"])
+    ground_latency_s = float(cfg.get("ground", {}).get("latency_s", 0.0))
+    for action, task in zip(actions, tasks):
+        costs = task_costs(task, profile, cfg)
+        if action in {"ON", "PRE"} and (costs[action].memory_gb > memory_limit or costs[action].energy_j > sim_energy_left):
+            action = "DOWN"
+        cost = costs[action]
+        if action == "ON":
+            completion = max(task.arrival_s, sim_compute_ready) + cost.latency_s
+            sim_compute_ready = completion
+            sim_energy_left -= cost.energy_j
+            value += value_at(task, completion)
+        elif action == "PRE":
+            pre_done = max(task.arrival_s, sim_compute_ready) + cost.latency_s
+            sim_compute_ready = pre_done
+            sim_energy_left -= cost.energy_j
+            completion = sim_scheduler.schedule(pre_done, cost.bits, commit=True) + ground_latency_s
+            value += value_at(task, completion) * cost.value_factor
+        else:
+            completion = sim_scheduler.schedule(task.arrival_s, cost.bits, commit=True) + ground_latency_s
+            value += value_at(task, completion)
+    return value
+
+
+def choose_mpc(
+    tasks_window: list[Task],
+    windows: list[Window],
+    profile: pd.DataFrame,
+    cfg: dict[str, Any],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    lookahead: int,
+) -> str:
+    horizon_tasks = tasks_window[: max(1, lookahead)]
+    best_action = "DOWN"
+    best_value = -1.0
+    for actions in itertools.product(("ON", "PRE", "DOWN"), repeat=len(horizon_tasks)):
+        value = _simulate_action_sequence(actions, horizon_tasks, windows, profile, cfg, scheduler, compute_ready_s, energy_left)
+        if value > best_value:
+            best_value = value
+            best_action = actions[0]
+    return best_action
+
+
 def run_policy(
     policy: str,
     tasks: list[Task],
@@ -359,10 +567,18 @@ def run_policy(
     *,
     allow_pre: bool = True,
     split_energy: bool = True,
+    decision_tasks: list[Task] | None = None,
+    energy_model: str = "static",
 ) -> tuple[dict[str, float | str | int], pd.DataFrame]:
     horizon_s = cfg["horizon_h"] * 3600.0
     scheduler = DownlinkScheduler(windows, horizon_s)
-    energy_left = float(cfg["satellite"]["energy_budget_j"])
+    soft_energy = energy_model == "soft"
+    if energy_model == "soc":
+        battery_capacity = float(cfg.get("soc", {}).get("battery_capacity_j", cfg["satellite"]["energy_budget_j"]))
+        energy_left = battery_capacity * float(cfg.get("soc", {}).get("initial_soc_fraction", 1.0))
+    else:
+        battery_capacity = float(cfg["satellite"]["energy_budget_j"])
+        energy_left = float(cfg["satellite"]["energy_budget_j"])
     compute_ready_s = 0.0
     total_value = 0.0
     energy_used = 0.0
@@ -373,28 +589,81 @@ def run_policy(
     energy_violations = 0
     raw_bits = sum(t.data_bits for t in tasks)
     action_counts = {"ON": 0, "PRE": 0, "DOWN": 0, "DROP": 0}
+    ground_latency_s = float(cfg.get("ground", {}).get("latency_s", 0.0))
+    min_energy_left = energy_left
+    last_energy_update_s = 0.0
+    adaptive_cfg = copy.deepcopy(cfg)
+    adaptive = adaptive_cfg.get("adaptive_tvd", {})
+    adaptive_cfg.setdefault("heuristic", {})
+    adaptive_cfg["heuristic"]["lambda_energy"] = float(adaptive.get("lambda_energy_init", adaptive_cfg["heuristic"].get("lambda_energy", 4.0)))
+    adaptive_cfg["heuristic"]["lambda_bandwidth"] = float(adaptive.get("lambda_bandwidth_init", adaptive_cfg["heuristic"].get("lambda_bandwidth", 0.45)))
+    lambda_energy_trace: list[float] = []
+    lambda_bandwidth_trace: list[float] = []
+    decision_times_ms: list[float] = []
 
-    for task in tasks:
+    for task_idx, task in enumerate(tasks):
+        if energy_model == "soc":
+            energy_left = min(battery_capacity, energy_left + solar_recharge_j(cfg, last_energy_update_s, task.arrival_s))
+            last_energy_update_s = task.arrival_s
+            min_energy_left = min(min_energy_left, energy_left)
+        decision_task = decision_tasks[task_idx] if decision_tasks is not None else task
         costs = task_costs(task, profile, cfg)
-        decision_costs = costs if split_energy else task_costs(task, profile, cfg, split_energy=False)
+        decision_costs = task_costs(decision_task, profile, cfg, split_energy=split_energy)
         action = "DOWN"
+        t_decision = time.perf_counter()
         if policy == "All-Downlink":
             action = "DOWN"
         elif policy == "All-On-Board":
             action = "ON"
         elif policy == "Fixed-Threshold":
             action = choose_fixed_threshold(task, costs, energy_left, cfg)
+        elif policy == "Priority-Aware":
+            action = choose_priority_aware(task, costs, energy_left, cfg)
+        elif policy == "Deadline-Energy":
+            action = choose_deadline_energy(task, costs, scheduler, compute_ready_s, energy_left, cfg)
+        elif policy == "Energy-WSRPT":
+            action = choose_energy_wsrpt(task, costs, scheduler, compute_ready_s, energy_left, cfg)
         elif policy == "Heuristic-TVD":
-            action = choose_heuristic(task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre, split_energy=split_energy)
+            action = choose_heuristic(
+                task,
+                decision_costs,
+                scheduler,
+                compute_ready_s,
+                energy_left,
+                cfg,
+                allow_pre=allow_pre,
+                split_energy=split_energy,
+                hard_energy=not soft_energy,
+            )
+        elif policy == "Adaptive-TVD":
+            action = choose_heuristic(
+                decision_task,
+                decision_costs,
+                scheduler,
+                compute_ready_s,
+                energy_left,
+                adaptive_cfg,
+                allow_pre=allow_pre,
+                split_energy=split_energy,
+                hard_energy=not soft_energy,
+            )
+        elif policy.startswith("MPC-"):
+            try:
+                lookahead = int(policy.split("-", 1)[1])
+            except Exception:
+                lookahead = int(cfg.get("mpc", {}).get("lookahead", 5))
+            future_tasks = decision_tasks[task_idx:] if decision_tasks is not None else tasks[task_idx:]
+            action = choose_mpc(future_tasks, windows, profile, cfg, scheduler, compute_ready_s, energy_left, lookahead)
         else:
             raise ValueError(f"unknown policy: {policy}")
+        decision_times_ms.append((time.perf_counter() - t_decision) * 1000.0)
 
         cost = costs[action]
         if action in {"ON", "PRE"} and cost.memory_gb > cfg["satellite"]["memory_gb"]:
             oom_count += 1
             action = "DOWN"
             cost = costs[action]
-        if action in {"ON", "PRE"} and cost.energy_j > energy_left:
+        if action in {"ON", "PRE"} and cost.energy_j > energy_left and not soft_energy:
             energy_violations += 1
             action = "DOWN" if policy != "All-On-Board" else "DROP"
             cost = costs["DOWN"] if action == "DOWN" else ActionCost(0.0, 0.0, 0.0, 0.0, 0.0)
@@ -415,11 +684,23 @@ def run_policy(
             compute_ready_s = pre_done
             energy_left -= cost.energy_j
             energy_used += cost.energy_j
-            completion = scheduler.schedule(pre_done, cost.bits, commit=True)
+            completion = scheduler.schedule(pre_done, cost.bits, commit=True) + ground_latency_s
             realized = value_at(task, completion) * cost.value_factor
         else:
-            completion = scheduler.schedule(task.arrival_s, cost.bits, commit=True)
+            completion = scheduler.schedule(task.arrival_s, cost.bits, commit=True) + ground_latency_s
             realized = value_at(task, completion)
+        min_energy_left = min(min_energy_left, energy_left)
+
+        if policy == "Adaptive-TVD":
+            progress = (task_idx + 1) / max(len(tasks), 1)
+            energy_fraction = energy_used / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+            bandwidth_fraction = scheduler.used_total / max(scheduler.capacity_total, 1.0)
+            alpha_e = float(adaptive.get("alpha_energy", 2.0))
+            alpha_b = float(adaptive.get("alpha_bandwidth", 0.8))
+            adaptive_cfg["heuristic"]["lambda_energy"] = max(0.0, float(adaptive_cfg["heuristic"]["lambda_energy"]) + alpha_e * (energy_fraction - progress))
+            adaptive_cfg["heuristic"]["lambda_bandwidth"] = max(0.0, float(adaptive_cfg["heuristic"]["lambda_bandwidth"]) + alpha_b * (bandwidth_fraction - progress))
+            lambda_energy_trace.append(float(adaptive_cfg["heuristic"]["lambda_energy"]))
+            lambda_bandwidth_trace.append(float(adaptive_cfg["heuristic"]["lambda_bandwidth"]))
 
         action_counts[action] = action_counts.get(action, 0) + 1
         if realized > 1e-9:
@@ -442,6 +723,8 @@ def run_policy(
         )
 
     transmitted_bits = scheduler.used_total
+    energy_budget = float(cfg["satellite"]["energy_budget_j"])
+    energy_overrun_j = max(0.0, energy_used - energy_budget)
     metrics: dict[str, float | str | int] = {
         "policy": policy,
         "total_value": total_value,
@@ -464,6 +747,13 @@ def run_policy(
         "down_pct": 100.0 * action_counts["DOWN"] / max(len(tasks), 1),
         "drop_pct": 100.0 * action_counts["DROP"] / max(len(tasks), 1),
         "residual_energy_j": energy_left,
+        "min_energy_j": min_energy_left,
+        "energy_overrun_j": energy_overrun_j,
+        "mean_decision_ms": float(np.mean(decision_times_ms)) if decision_times_ms else 0.0,
+        "lambda_energy_final": lambda_energy_trace[-1] if lambda_energy_trace else np.nan,
+        "lambda_bandwidth_final": lambda_bandwidth_trace[-1] if lambda_bandwidth_trace else np.nan,
+        "lambda_energy_mean": float(np.mean(lambda_energy_trace)) if lambda_energy_trace else np.nan,
+        "lambda_bandwidth_mean": float(np.mean(lambda_bandwidth_trace)) if lambda_bandwidth_trace else np.nan,
     }
     return metrics, pd.DataFrame(events)
 
@@ -473,11 +763,12 @@ def run_milp_bound(tasks: list[Task], windows: list[Window], profile: pd.DataFra
         import pulp
     except Exception:
         metrics, _ = run_policy("Heuristic-TVD", tasks, windows, profile, cfg)
-        metrics["policy"] = "MILP-Bound"
+        metrics["policy"] = "MILP-Ref"
         metrics["total_value"] = float(metrics["total_value"]) * 1.05
         return metrics
 
     horizon_s = cfg["horizon_h"] * 3600.0
+    latest_s = horizon_s + 12 * 3600.0
     max_tasks = min(len(tasks), int(cfg["milp"]["max_tasks"]))
     sub_tasks = tasks[:max_tasks]
     window_for_task: list[int] = []
@@ -488,33 +779,47 @@ def run_milp_bound(tasks: list[Task], windows: list[Window], profile: pd.DataFra
     problem = pulp.LpProblem("orbitllm_bound", pulp.LpMaximize)
     actions = ["ON", "PRE", "DOWN"]
     y = pulp.LpVariable.dicts("y", (range(max_tasks), actions), lowBound=0, upBound=1, cat="Binary")
-    values: dict[tuple[int, str], float] = {}
+    release = pulp.LpVariable.dicts("release", range(max_tasks), lowBound=0, upBound=latest_s, cat="Continuous")
+    completion = pulp.LpVariable.dicts("completion", range(max_tasks), lowBound=0, upBound=latest_s, cat="Continuous")
+    time_step_s = int(cfg["milp"].get("time_step_s", 1800))
+    time_grid = np.arange(0.0, latest_s + time_step_s, time_step_s)
+    z = pulp.LpVariable.dicts("z", (range(max_tasks), actions, range(len(time_grid))), lowBound=0, upBound=1, cat="Binary")
     energies: dict[tuple[int, str], float] = {}
     bits: dict[tuple[int, str], float] = {}
+    latencies: dict[tuple[int, str], float] = {}
+    values: dict[tuple[int, str, int], float] = {}
     for i, task in enumerate(sub_tasks):
         costs = task_costs(task, profile, cfg)
         for action in actions:
             cost = costs[action]
-            feasible = True
-            if action in {"ON", "PRE"}:
-                feasible = cost.memory_gb <= cfg["satellite"]["memory_gb"]
-                completion = task.arrival_s + cost.latency_s
-                if action == "PRE":
-                    w = windows[window_for_task[i]]
-                    completion = max(completion, w.start_s) + cost.bits / w.rate_bps
-            else:
-                w = windows[window_for_task[i]]
-                completion = max(task.arrival_s, w.start_s) + cost.bits / w.rate_bps
-            if not feasible:
-                values[(i, action)] = -1e6
-            else:
-                values[(i, action)] = value_at(task, min(completion, horizon_s)) * cost.value_factor
             energies[(i, action)] = cost.energy_j
             bits[(i, action)] = cost.bits
+            latencies[(i, action)] = cost.latency_s if action in {"ON", "PRE"} else 0.0
+            if action in {"ON", "PRE"} and cost.memory_gb > cfg["satellite"]["memory_gb"]:
+                problem += y[i][action] == 0
+            for k, t in enumerate(time_grid):
+                values[(i, action, k)] = value_at(task, float(t)) * cost.value_factor
 
-    problem += pulp.lpSum(y[i][a] * values[(i, a)] for i in range(max_tasks) for a in actions)
+    problem += pulp.lpSum(z[i][a][k] * values[(i, a, k)] for i in range(max_tasks) for a in actions for k in range(len(time_grid)))
     for i in range(max_tasks):
         problem += pulp.lpSum(y[i][a] for a in actions) == 1
+        problem += pulp.lpSum(z[i][a][k] for a in actions for k in range(len(time_grid))) == 1
+        for action in actions:
+            problem += y[i][action] == pulp.lpSum(z[i][action][k] for k in range(len(time_grid)))
+        problem += completion[i] == pulp.lpSum(float(time_grid[k]) * z[i][a][k] for a in actions for k in range(len(time_grid)))
+        compute_latency = y[i]["ON"] * latencies[(i, "ON")] + y[i]["PRE"] * latencies[(i, "PRE")]
+        if i == 0:
+            problem += release[i] >= compute_latency
+        else:
+            problem += release[i] >= release[i - 1] + compute_latency
+        problem += release[i] >= sub_tasks[i].arrival_s + compute_latency
+        problem += completion[i] >= sub_tasks[i].arrival_s
+        problem += completion[i] >= release[i] - latest_s * (1 - y[i]["ON"])
+        w = windows[window_for_task[i]]
+        pre_link_s = bits[(i, "PRE")] / max(w.rate_bps, 1.0)
+        down_done = max(sub_tasks[i].arrival_s, w.start_s) + bits[(i, "DOWN")] / max(w.rate_bps, 1.0)
+        problem += completion[i] >= release[i] + pre_link_s - latest_s * (1 - y[i]["PRE"])
+        problem += completion[i] >= down_done - latest_s * (1 - y[i]["DOWN"])
     problem += pulp.lpSum(y[i][a] * energies[(i, a)] for i in range(max_tasks) for a in actions) <= cfg["satellite"]["energy_budget_j"]
     for w_idx, window in enumerate(windows):
         problem += (
@@ -532,14 +837,12 @@ def run_milp_bound(tasks: list[Task], windows: list[Window], profile: pd.DataFra
     if max_tasks < len(tasks):
         scale = sum(t.value0 for t in tasks) / max(sum(t.value0 for t in sub_tasks), 1.0)
         value *= scale
-    heuristic, _ = run_policy("Heuristic-TVD", tasks, windows, profile, cfg)
-    value = max(value, float(heuristic["total_value"]) * 1.01)
     return {
-        "policy": "MILP-Bound",
+        "policy": "MILP-Ref",
         "total_value": value,
-        "energy_j": float(cfg["satellite"]["energy_budget_j"]),
+        "energy_j": np.nan,
         "useful_tasks": len(tasks),
-        "j_per_task": float(cfg["satellite"]["energy_budget_j"]) / max(len(tasks), 1),
+        "j_per_task": np.nan,
         "raw_bits": sum(t.data_bits for t in tasks),
         "transmitted_bits": np.nan,
         "bw_saving": np.nan,
@@ -553,7 +856,7 @@ def run_milp_bound(tasks: list[Task], windows: list[Window], profile: pd.DataFra
 def run_experiment(cfg: dict[str, Any], profile: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     metrics_rows: list[dict[str, float | str | int]] = []
     timeseries_rows: list[pd.DataFrame] = []
-    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Heuristic-TVD"]
+    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Deadline-Energy", "Priority-Aware", "Heuristic-TVD"]
     for seed in cfg["seeds"]:
         tasks = generate_tasks(cfg, int(seed))
         windows = generate_windows(cfg)
@@ -584,7 +887,7 @@ def run_experiment(cfg: dict[str, Any], profile: pd.DataFrame) -> tuple[pd.DataF
         idx = metrics_df["seed"] == seed
         metrics_df.loc[idx, "bw_saving"] = 100.0 * (1.0 - metrics_df.loc[idx, "transmitted_bits"] / baseline_bits)
         metrics_df.loc[idx & (metrics_df["policy"] == "All-Downlink"), "bw_saving"] = 0.0
-        metrics_df.loc[idx & (metrics_df["policy"] == "MILP-Bound"), "bw_saving"] = np.nan
+        metrics_df.loc[idx & (metrics_df["policy"] == "MILP-Ref"), "bw_saving"] = np.nan
     timeseries_df = pd.concat(timeseries_rows, ignore_index=True)
 
     ablation_rows: list[dict[str, float | str | int]] = []
@@ -626,7 +929,7 @@ def _normalize_by_group(df: pd.DataFrame, group_cols: list[str]) -> pd.DataFrame
 
 def run_network_sensitivity(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, float | str | int]] = []
-    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Heuristic-TVD"]
+    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Deadline-Energy", "Priority-Aware", "Heuristic-TVD"]
     base_rate = float(cfg["orbit"]["downlink_rate_mbps"])
     base_visible = float(cfg["orbit"]["visible_min"])
     sweeps = [("rate", v, f"{v:g} Mbps") for v in [5.0, 10.0, 35.0, 100.0]]
@@ -694,7 +997,7 @@ def run_pre_sensitivity(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFr
 
 def run_hardware_sensitivity(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, float | str | int]] = []
-    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Heuristic-TVD"]
+    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Deadline-Energy", "Priority-Aware", "Heuristic-TVD"]
     profiles = [
         ("0.5x", 0.5, 0.5),
         ("1.0x 4090", 1.0, 1.0),
@@ -722,9 +1025,53 @@ def run_hardware_sensitivity(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.D
     return _normalize_by_group(pd.DataFrame(rows), ["seed", "energy_scale", "latency_scale"])
 
 
+def run_heuristic_sensitivity(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    heur = cfg.get("heuristic", {})
+    beta_values = [float(v) for v in heur.get("sweep_beta", [0.0, 0.35, 0.7])]
+    energy_values = [float(v) for v in heur.get("sweep_lambda_energy", [2.0, 4.0, 8.0])]
+    bandwidth_values = [float(v) for v in heur.get("sweep_lambda_bandwidth", [0.2, 0.45, 0.9])]
+    default_beta = float(heur.get("beta", 0.35))
+    default_energy = float(heur.get("lambda_energy", 4.0))
+    default_bandwidth = float(heur.get("lambda_bandwidth", 0.45))
+    epsilon = float(heur.get("epsilon", 0.015))
+    for beta in beta_values:
+        for lambda_energy in energy_values:
+            for lambda_bandwidth in bandwidth_values:
+                cfg_s = copy.deepcopy(cfg)
+                cfg_s["heuristic"] = {
+                    **cfg_s.get("heuristic", {}),
+                    "beta": beta,
+                    "lambda_energy": lambda_energy,
+                    "lambda_bandwidth": lambda_bandwidth,
+                    "epsilon": epsilon,
+                }
+                is_default = (
+                    abs(beta - default_beta) < 1e-9
+                    and abs(lambda_energy - default_energy) < 1e-9
+                    and abs(lambda_bandwidth - default_bandwidth) < 1e-9
+                )
+                for seed in cfg_s["seeds"]:
+                    tasks = generate_tasks(cfg_s, int(seed))
+                    windows = generate_windows(cfg_s)
+                    metrics, _ = run_policy("Heuristic-TVD", tasks, windows, profile, cfg_s)
+                    metrics.update(
+                        {
+                            "seed": seed,
+                            "beta": beta,
+                            "lambda_energy": lambda_energy,
+                            "lambda_bandwidth": lambda_bandwidth,
+                            "epsilon": epsilon,
+                            "is_default": int(is_default),
+                        }
+                    )
+                    rows.append(metrics)
+    return _normalize_by_group(pd.DataFrame(rows), ["seed"])
+
+
 def run_tle_realism(cfg: dict[str, Any], profile: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows: list[dict[str, float | str | int]] = []
-    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Heuristic-TVD"]
+    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Deadline-Energy", "Priority-Aware", "Heuristic-TVD"]
     fixed_windows = generate_windows(cfg)
     tle_windows, contact_df = generate_tle_windows(cfg)
     models = [
@@ -750,11 +1097,224 @@ def run_tle_realism(cfg: dict[str, Any], profile: pd.DataFrame) -> tuple[pd.Data
     return df, contact_df
 
 
+def _with_decode(tasks: list[Task], decode_tokens: list[int]) -> list[Task]:
+    return [replace(task, decode_tokens=int(max(1, dec))) for task, dec in zip(tasks, decode_tokens)]
+
+
+def run_decode_uncertainty(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    policies = ["Deadline-Energy", "Priority-Aware", "Heuristic-TVD"]
+    mean_decode = int(round(float(np.mean(cfg["tasks"]["decode_tokens"]))))
+    for seed in cfg["seeds"]:
+        tasks = generate_tasks(cfg, int(seed))
+        windows = generate_windows(cfg)
+        real_decodes = [task.decode_tokens for task in tasks]
+        rng = np.random.default_rng(int(seed) + 5000)
+        noisy = [max(1, int(round(d * float(rng.lognormal(0.0, 0.45))))) for d in real_decodes]
+        variants = [
+            ("known", tasks, tasks),
+            ("expected-only", tasks, _with_decode(tasks, [mean_decode for _ in tasks])),
+            ("noisy-estimate", tasks, _with_decode(tasks, noisy)),
+        ]
+        for cap in [64, 128, 256]:
+            capped = _with_decode(tasks, [min(d, cap) for d in real_decodes])
+            variants.append((f"cap-{cap}", capped, capped))
+        for variant, actual_tasks, decision_tasks in variants:
+            for policy in policies:
+                metrics, _ = run_policy(policy, actual_tasks, windows, profile, cfg, decision_tasks=decision_tasks)
+                metrics.update({"seed": seed, "variant": variant, "decode_mean_est": mean_decode})
+                rows.append(metrics)
+    return _normalize_by_group(pd.DataFrame(rows), ["seed", "variant"])
+
+
+def run_optimality_gap(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    base_milp = cfg.get("milp", {})
+    gap_cfg = cfg.get("optimality_gap", {})
+    task_counts = [int(v) for v in gap_cfg.get("task_counts", [20, 40, 60, 80])]
+    gap_horizon_h = float(gap_cfg.get("horizon_h", 6))
+    gap_time_step_s = int(gap_cfg.get("time_step_s", 600))
+    gap_timeout_s = int(gap_cfg.get("timeout_s", 90))
+    for task_count in task_counts:
+        for seed in cfg["seeds"]:
+            cfg_s = copy.deepcopy(cfg)
+            cfg_s["horizon_h"] = gap_horizon_h
+            cfg_s["milp"] = {**base_milp, "max_tasks": task_count, "time_step_s": gap_time_step_s, "timeout_s": gap_timeout_s}
+            tasks = generate_tasks(cfg_s, int(seed), horizon_h=gap_horizon_h, limit=task_count)
+            windows = generate_windows(cfg_s, horizon_h=gap_horizon_h)
+            t0 = time.perf_counter()
+            heur, _ = run_policy("Heuristic-TVD", tasks, windows, profile, cfg_s)
+            milp = run_milp_bound(tasks, windows, profile, cfg_s)
+            solve_s = time.perf_counter() - t0
+            milp_value = float(milp["total_value"])
+            heur_value = float(heur["total_value"])
+            rows.append(
+                {
+                    "seed": seed,
+                    "task_count": task_count,
+                    "heuristic_value": heur_value,
+                    "milp_ref_value": milp_value,
+                    "gap": max(0.0, (milp_value - heur_value) / max(milp_value, 1e-9)),
+                    "heuristic_over_ref": int(heur_value > milp_value),
+                    "solve_time_s": solve_s,
+                    "time_step_s": cfg_s["milp"]["time_step_s"],
+                    "timeout_s": cfg_s["milp"]["timeout_s"],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def run_adaptive_tvd(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    policies = ["Heuristic-TVD", "Adaptive-TVD"]
+    for seed in cfg["seeds"]:
+        tasks = generate_tasks(cfg, int(seed))
+        windows = generate_windows(cfg)
+        for policy in policies:
+            metrics, _ = run_policy(policy, tasks, windows, profile, cfg)
+            metrics.update({"seed": seed, "variant": policy})
+            rows.append(metrics)
+    return _normalize_by_group(pd.DataFrame(rows), ["seed"])
+
+
+def run_soc_dynamics(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    variants = [
+        ("static-budget", None, "static"),
+        ("soc-low", 20.0, "soc"),
+        ("soc-nominal", 35.0, "soc"),
+        ("soc-high", 55.0, "soc"),
+    ]
+    for label, charge_w, energy_model in variants:
+        cfg_s = copy.deepcopy(cfg)
+        if charge_w is not None:
+            cfg_s["soc"]["enabled"] = True
+            cfg_s["soc"]["charge_power_w"] = charge_w
+        for seed in cfg_s["seeds"]:
+            tasks = generate_tasks(cfg_s, int(seed))
+            windows = generate_windows(cfg_s)
+            metrics, _ = run_policy("Heuristic-TVD", tasks, windows, profile, cfg_s, energy_model=energy_model)
+            metrics.update({"seed": seed, "variant": label, "charge_power_w": charge_w if charge_w is not None else 0.0})
+            rows.append(metrics)
+    return _normalize_by_group(pd.DataFrame(rows), ["seed"])
+
+
+def run_ground_latency(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    policies = ["All-Downlink", "Deadline-Energy", "Priority-Aware", "Heuristic-TVD"]
+    for latency_s in [0.0, 10.0, 60.0, 300.0]:
+        cfg_s = copy.deepcopy(cfg)
+        cfg_s["ground"]["latency_s"] = latency_s
+        for seed in cfg_s["seeds"]:
+            tasks = generate_tasks(cfg_s, int(seed))
+            windows = generate_windows(cfg_s)
+            for policy in policies:
+                metrics, _ = run_policy(policy, tasks, windows, profile, cfg_s)
+                metrics.update({"seed": seed, "ground_latency_s": latency_s})
+                rows.append(metrics)
+    return _normalize_by_group(pd.DataFrame(rows), ["seed", "ground_latency_s"])
+
+
+def run_mpc_baselines(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    policies = ["Deadline-Energy", "Priority-Aware", "Heuristic-TVD", "MPC-3", "MPC-5"]
+    mpc_cfg = cfg.get("mpc", {})
+    task_limit = int(mpc_cfg.get("max_tasks", cfg["tasks"]["count_per_24h"]))
+    horizon_h = float(mpc_cfg.get("horizon_h", cfg["horizon_h"]))
+    cfg_s = copy.deepcopy(cfg)
+    cfg_s["horizon_h"] = horizon_h
+    for seed in cfg["seeds"]:
+        tasks = generate_tasks(cfg_s, int(seed), horizon_h=horizon_h, limit=task_limit)
+        windows = generate_windows(cfg_s, horizon_h=horizon_h)
+        for policy in policies:
+            metrics, _ = run_policy(policy, tasks, windows, profile, cfg_s)
+            metrics.update({"seed": seed, "variant": policy, "task_count": len(tasks), "mpc_horizon_h": horizon_h})
+            rows.append(metrics)
+    return _normalize_by_group(pd.DataFrame(rows), ["seed"])
+
+
+def run_soft_energy(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
+    rows: list[dict[str, float | str | int]] = []
+    soft_cfg = cfg.get("soft_energy", {})
+    penalty_values = [float(v) for v in soft_cfg.get("penalty_value_per_kj", [0.0, 1.0, 5.0, 10.0])]
+    lambda_values = [float(v) for v in soft_cfg.get("lambda_energy", [0.0, 2.0, 8.0, 16.0])]
+    if len(lambda_values) != len(penalty_values):
+        lambda_values = [float(cfg.get("heuristic", {}).get("lambda_energy", 8.0)) for _ in penalty_values]
+
+    for seed in cfg["seeds"]:
+        tasks = generate_tasks(cfg, int(seed))
+        windows = generate_windows(cfg)
+        hard_metrics, _ = run_policy("Heuristic-TVD", tasks, windows, profile, cfg)
+        hard_metrics.update(
+            {
+                "seed": seed,
+                "variant": "hard-budget",
+                "penalty_value_per_kj": np.nan,
+                "soft_lambda_energy": float(cfg.get("heuristic", {}).get("lambda_energy", 8.0)),
+                "penalized_value": float(hard_metrics["total_value"]),
+            }
+        )
+        rows.append(hard_metrics)
+
+        for penalty_per_kj, lambda_energy in zip(penalty_values, lambda_values):
+            cfg_s = copy.deepcopy(cfg)
+            cfg_s.setdefault("heuristic", {})
+            cfg_s["heuristic"]["lambda_energy"] = lambda_energy
+            tasks_s = generate_tasks(cfg_s, int(seed))
+            windows_s = generate_windows(cfg_s)
+            metrics, _ = run_policy("Heuristic-TVD", tasks_s, windows_s, profile, cfg_s, energy_model="soft")
+            overrun_kj = float(metrics.get("energy_overrun_j", 0.0)) / 1000.0
+            metrics.update(
+                {
+                    "seed": seed,
+                    "variant": f"soft-penalty-{penalty_per_kj:g}",
+                    "penalty_value_per_kj": penalty_per_kj,
+                    "soft_lambda_energy": lambda_energy,
+                    "penalized_value": float(metrics["total_value"]) - penalty_per_kj * overrun_kj,
+                }
+            )
+            rows.append(metrics)
+
+    df = _normalize_by_group(pd.DataFrame(rows), ["seed"])
+    df["normalized_penalized_value"] = df.groupby("seed")["penalized_value"].transform(lambda x: x / max(float(x.max()), 1e-9))
+    return df
+
+
+def run_iotj_required_experiments(cfg: dict[str, Any], profile: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    return {
+        "decode": run_decode_uncertainty(cfg, profile),
+        "optimality": run_optimality_gap(cfg, profile),
+        "adaptive": run_adaptive_tvd(cfg, profile),
+        "soc": run_soc_dynamics(cfg, profile),
+        "ground": run_ground_latency(cfg, profile),
+        "mpc": run_mpc_baselines(cfg, profile),
+    }
+
+
+def write_iotj_required_experiments(cfg: dict[str, Any], profile: pd.DataFrame) -> None:
+    jobs = [
+        ("decode", run_decode_uncertainty, cfg.get("decode_uncertainty_path", "results/decode_uncertainty_metrics.csv")),
+        ("optimality", run_optimality_gap, cfg.get("optimality_gap_path", "results/optimality_gap_metrics.csv")),
+        ("adaptive", run_adaptive_tvd, cfg.get("adaptive_tvd_path", "results/adaptive_tvd_metrics.csv")),
+        ("soc", run_soc_dynamics, cfg.get("soc_dynamics_path", "results/soc_dynamics_metrics.csv")),
+        ("ground", run_ground_latency, cfg.get("ground_latency_path", "results/ground_latency_metrics.csv")),
+        ("mpc", run_mpc_baselines, cfg.get("mpc_baseline_path", "results/mpc_baseline_metrics.csv")),
+    ]
+    for name, runner, path in jobs:
+        print(f"starting IoT-J experiment: {name}", flush=True)
+        df = runner(cfg, profile)
+        out_path = resolve_project_path(path)
+        df.to_csv(out_path, index=False)
+        print(f"wrote {name}: {out_path} rows={len(df)}", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run OrbitLLM scheduling simulation.")
     parser.add_argument("--config", default=None)
     parser.add_argument("--profile", default=None)
     parser.add_argument("--only-tle", action="store_true", help="Run only the fixed-window vs. TLE-derived contact trace check.")
+    parser.add_argument("--iotj-required", action="store_true", help="Run IoT-J required supplemental simulation experiments.")
+    parser.add_argument("--soft-energy", action="store_true", help="Run soft-energy penalty robustness experiment.")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -763,7 +1323,15 @@ def main(argv: list[str] | None = None) -> int:
     if not resolve_project_path(profile_path).exists():
         write_default_profile(profile_path)
     profile = load_profile(profile_path)
-    if getattr(args, "only_tle", False):
+    if getattr(args, "soft_energy", False):
+        soft = run_soft_energy(cfg, profile)
+        out = resolve_project_path(cfg.get("soft_energy_path", "results/soft_energy_metrics.csv"))
+        soft.to_csv(out, index=False)
+        print(f"wrote {out}")
+    elif getattr(args, "iotj_required", False):
+        write_iotj_required_experiments(cfg, profile)
+        print("wrote IoT-J required experiment CSVs")
+    elif getattr(args, "only_tle", False):
         tle, contacts = run_tle_realism(cfg, profile)
         tle.to_csv(resolve_project_path(cfg.get("tle_realism_path", "results/tle_realism_metrics.csv")), index=False)
         contacts.to_csv(resolve_project_path(cfg.get("tle_contact_path", "results/tle_contact_trace.csv")), index=False)
@@ -773,6 +1341,7 @@ def main(argv: list[str] | None = None) -> int:
         network = run_network_sensitivity(cfg, profile)
         pre = run_pre_sensitivity(cfg, profile)
         hardware = run_hardware_sensitivity(cfg, profile)
+        heuristic = run_heuristic_sensitivity(cfg, profile)
         tle, contacts = run_tle_realism(cfg, profile)
         metrics.to_csv(resolve_project_path(cfg["metrics_path"]), index=False)
         timeseries.to_csv(resolve_project_path(cfg["timeseries_path"]), index=False)
@@ -781,6 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
         network.to_csv(resolve_project_path(cfg.get("network_sensitivity_path", "results/network_sensitivity_metrics.csv")), index=False)
         pre.to_csv(resolve_project_path(cfg.get("pre_sensitivity_path", "results/pre_sensitivity_metrics.csv")), index=False)
         hardware.to_csv(resolve_project_path(cfg.get("hardware_sensitivity_path", "results/hardware_sensitivity_metrics.csv")), index=False)
+        heuristic.to_csv(resolve_project_path(cfg.get("heuristic_sensitivity_path", "results/heuristic_sensitivity_metrics.csv")), index=False)
         tle.to_csv(resolve_project_path(cfg.get("tle_realism_path", "results/tle_realism_metrics.csv")), index=False)
         contacts.to_csv(resolve_project_path(cfg.get("tle_contact_path", "results/tle_contact_trace.csv")), index=False)
         print(f"wrote {cfg['metrics_path']}, {cfg['timeseries_path']}, {cfg['ablation_path']}, {cfg['sensitivity_path']}")

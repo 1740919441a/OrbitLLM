@@ -6,6 +6,7 @@ __pycache__/
 venv/
 
 # LaTeX build products
+*.tex
 *.aux
 *.bbl
 *.blg
@@ -13,13 +14,25 @@ venv/
 *.fls
 *.log
 *.out
+*.pdf
 *.synctex.gz
+refs.bib
+sections/
+iotj_sections/
 
 # Local model/cache directories
 models/
 hf_cache/
 .cache/
+datasets/
+tmp/
 
-# Large archives from the original bundle
+# Generated experiment outputs and paper assets
+results/
+logs/
+figures/
+
+# Large archives and local documents from the original bundle
 *.tar.gz
 *.zip
+*.docx

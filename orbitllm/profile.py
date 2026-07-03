@@ -150,5 +150,7 @@ def profile_table_rows(profile: pd.DataFrame, quant: str, context_len: int = 204
             "throughput": float(row["tokens_per_sec"]),
             "prefill_mj": float(row["prefill_j_per_tok"]) * 1000.0,
             "decode_mj": float(row["decode_j_per_tok"]) * 1000.0,
+            "prefill_prompt_j": float(row["prefill_j_per_tok"]) * float(row["prefill_tokens"]),
+            "decode_j": float(row["decode_j_per_tok"]),
             "peak_mem": float(row["peak_mem_gb"]),
         }

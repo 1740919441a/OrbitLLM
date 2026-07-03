@@ -1,7 +1,7 @@
 {
   "output_dir": "results",
   "figures_dir": "figures",
-  "profile_path": "results/profile_anchor.csv",
+  "profile_path": "results/profile_rebench_prefill8.csv",
   "metrics_path": "results/simulation_metrics.csv",
   "timeseries_path": "results/value_timeseries.csv",
   "ablation_path": "results/ablation_metrics.csv",
@@ -112,9 +112,9 @@
   },
   "benchmark": {
     "models": [
-      {"model": "Qwen/Qwen3-1.7B", "scale_b": 1.7},
-      {"model": "Qwen/Qwen2.5-3B-Instruct", "scale_b": 3.0},
-      {"model": "Qwen/Qwen3-8B", "scale_b": 8.0}
+      {"model": "/root/autodl-tmp/models/Qwen3-1.7B", "scale_b": 1.7},
+      {"model": "/root/autodl-tmp/models/Qwen2.5-3B-Instruct", "scale_b": 3.0},
+      {"model": "/root/autodl-tmp/models/Qwen3-8B", "scale_b": 8.0}
     ],
     "quants": ["FP16", "INT8", "INT4"],
     "context_lengths": [512, 1024, 2048, 4096],

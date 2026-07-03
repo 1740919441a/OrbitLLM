@@ -1,0 +1,91 @@
+{
+  "output_dir": "results",
+  "figures_dir": "figures",
+  "profile_path": "results/profile_local_4090_60w_qwen_1p7b_3b.csv",
+  "metrics_path": "results/local_4090_60w_simulation_metrics.csv",
+  "timeseries_path": "results/local_4090_60w_value_timeseries.csv",
+  "ablation_path": "results/local_4090_60w_ablation_metrics.csv",
+  "sensitivity_path": "results/local_4090_60w_sensitivity_metrics.csv",
+  "network_sensitivity_path": "results/local_4090_60w_network_sensitivity_metrics.csv",
+  "pre_sensitivity_path": "results/local_4090_60w_pre_sensitivity_metrics.csv",
+  "hardware_sensitivity_path": "results/local_4090_60w_hardware_sensitivity_metrics.csv",
+  "heuristic_sensitivity_path": "results/local_4090_60w_heuristic_sensitivity_metrics.csv",
+  "tle_contact_path": "results/local_4090_60w_tle_contact_trace.csv",
+  "tle_realism_path": "results/local_4090_60w_tle_realism_metrics.csv",
+  "horizon_h": 24,
+  "seeds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  "orbit": {
+    "period_min": 90,
+    "visible_min": 10,
+    "downlink_rate_mbps": 35
+  },
+  "tle": {
+    "enabled": true,
+    "tle_url": "https://celestrak.org/NORAD/elements/gp.php?CATNR=39084&FORMAT=TLE",
+    "cache_path": "results/tle_landsat8.txt",
+    "start_utc": "2026-07-02T00:00:00Z",
+    "step_s": 20,
+    "min_elevation_deg": 10,
+    "ground_stations": [
+      {"name": "Austin", "lat_deg": 30.2672, "lon_deg": -97.7431, "elevation_m": 150},
+      {"name": "Fairbanks", "lat_deg": 64.8378, "lon_deg": -147.7164, "elevation_m": 136},
+      {"name": "Svalbard", "lat_deg": 78.2298, "lon_deg": 15.4078, "elevation_m": 458}
+    ]
+  },
+  "satellite": {
+    "energy_budget_j": 150000,
+    "memory_gb": 16,
+    "quant": "FP16",
+    "pre_energy_fraction": 0.18,
+    "pre_latency_fraction": 0.18,
+    "pre_retention_fraction": 0.32,
+    "pre_value_fraction": 0.94
+  },
+  "heuristic": {
+    "beta": 0.0,
+    "lambda_energy": 8.0,
+    "lambda_bandwidth": 0.2,
+    "epsilon": 0.015,
+    "sweep_beta": [0.0, 0.35, 0.7],
+    "sweep_lambda_energy": [2.0, 4.0, 8.0],
+    "sweep_lambda_bandwidth": [0.2, 0.45, 0.9]
+  },
+  "wsrpt": {
+    "alpha_energy": 1.0,
+    "alpha_bandwidth": 0.15,
+    "value_floor": 0.001
+  },
+  "tasks": {
+    "count_per_24h": 260,
+    "scale_choices_b": [1.7, 3.0],
+    "scale_prob": [0.50, 0.50],
+    "data_mb_lognormal_mean": 4.0,
+    "data_mb_lognormal_sigma": 0.7,
+    "urgent_fraction": 0.36,
+    "urgent_half_life_min": [8, 30],
+    "routine_half_life_min": [90, 360],
+    "value_range": [8, 25],
+    "prefill_tokens": [384, 768, 1536],
+    "decode_tokens": [96, 160, 256],
+    "fixed_threshold": 18.0,
+    "priority_on_threshold": 0.55,
+    "priority_pre_threshold": 0.18
+  },
+  "milp": {
+    "max_tasks": 120,
+    "time_step_s": 1800,
+    "timeout_s": 30
+  },
+  "benchmark": {
+    "models": [
+      {"model": "models/Qwen3-1.7B", "scale_b": 1.7},
+      {"model": "models/Qwen2.5-3B-Instruct", "scale_b": 3.0}
+    ],
+    "quants": ["FP16"],
+    "context_lengths": [512, 1024, 2048],
+    "decode_tokens": 128,
+    "prefill_repeats": 8,
+    "idle_sample_s": 5,
+    "runs": 2
+  }
+}

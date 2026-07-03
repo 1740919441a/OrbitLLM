@@ -5,4 +5,5 @@ pulp>=2.8
 scipy>=1.12
 skyfield>=1.49
 sgp4>=2.23
-
+torch>=2.0
+torchvision>=0.15
