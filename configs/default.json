@@ -43,10 +43,15 @@
     "energy_budget_j": 150000,
     "memory_gb": 16,
     "quant": "INT4",
-    "pre_energy_fraction": 0.18,
-    "pre_latency_fraction": 0.18,
     "pre_retention_fraction": 0.32,
-    "pre_value_fraction": 0.94
+    "pre_value_fraction": 0.3729,
+    "pre_profile": {
+      "backend": "MobileSAM top-3 masks on EuroSAT",
+      "source_csv": "results/mobilesam_pre_calibration.csv",
+      "active_energy_j_per_task": 17.8613,
+      "latency_s_per_task": 0.2502,
+      "peak_mem_gb": 2.8231
+    }
   },
   "heuristic": {
     "beta": 0.0,
@@ -63,6 +68,69 @@
     "lambda_energy_init": 4.0,
     "lambda_bandwidth_init": 0.45
   },
+  "dpp_llm": {
+    "v_weight": 6.0,
+    "latency_weight": 0.2
+  },
+  "active_inf": {
+    "value_weight": 1.0,
+    "latency_weight": 0.35,
+    "energy_weight": 0.25,
+    "bandwidth_weight": 0.2,
+    "ambiguity_weight": 0.3
+  },
+  "hierarchical_ra": {
+    "delay_weight": 0.30,
+    "energy_weight": 0.22,
+    "bandwidth_weight": 0.18
+  },
+  "qos_multihop": {
+    "deadline_factor": 1.0,
+    "congestion_weight": 0.50,
+    "lateness_weight": 1.35,
+    "value_weight": 0.80
+  },
+  "delay_cost": {
+    "delay_weight": 0.62,
+    "energy_weight": 0.20,
+    "bandwidth_weight": 0.18
+  },
+  "pbr": {
+    "lookahead": 5,
+    "energy_price": 0.15,
+    "bandwidth_price": 0.10
+  },
+  "eh_dora": {
+    "value_weight": 1.0,
+    "latency_weight": 0.30,
+    "energy_weight": 0.25,
+    "bandwidth_weight": 0.15,
+    "reserve_weight": 0.80,
+    "reserve_fraction": 0.20,
+    "harvest_lookahead_min": 90
+  },
+  "peakmem": {
+    "value_weight": 1.0,
+    "latency_weight": 0.28,
+    "memory_weight": 0.55,
+    "decode_weight": 0.25,
+    "energy_weight": 0.12,
+    "bandwidth_weight": 0.12
+  },
+  "leo_drl": {
+    "alpha": 0.25,
+    "gamma": 0.9,
+    "epsilon": 0.15,
+    "training_seeds": [100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
+    "training_epochs": 4
+  },
+  "drl_ua": {
+    "alpha": 0.22,
+    "gamma": 0.90,
+    "epsilon": 0.15,
+    "training_seeds": [100, 101, 102, 103, 104, 105, 106, 107, 108, 109],
+    "training_epochs": 4
+  },
   "ground": {
     "latency_s": 0.0
   },
@@ -76,8 +144,8 @@
   },
   "mpc": {
     "lookahead": 5,
-    "horizon_h": 12,
-    "max_tasks": 120
+    "horizon_h": 6,
+    "max_tasks": 60
   },
   "optimality_gap": {
     "task_counts": [20, 40, 60],
@@ -104,6 +172,21 @@
     "fixed_threshold": 18.0,
     "priority_on_threshold": 0.55,
     "priority_pre_threshold": 0.18
+  },
+  "eurosat_workload": {
+    "task_count": 260,
+    "scale_b": 3.0,
+    "prefill_tokens": 1,
+    "decode_tokens": 25,
+    "value0": 1.0,
+    "half_life_min": 60.0,
+    "energy_budget_j": 15000.0,
+    "pre_value_factor": 0.3728813559,
+    "pre_profile_path": "results/mobilesam_pre_encoded_profile.csv",
+    "arrival_model": "controlled-uniform-over-24h",
+    "payload_model": "actual-EuroSAT-image-bytes",
+    "pre_retention_model": "per-image-MobileSAM-sam_top3-measured-JPEG-bytes",
+    "pre_utility_model": "per-image-CLIP-true-class-probability-retention"
   },
   "milp": {
     "max_tasks": 120,

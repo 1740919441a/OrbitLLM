@@ -192,6 +192,7 @@ def plot_value(timeseries: pd.DataFrame, fig_dir: Path) -> None:
         "Fixed-Threshold": OK["green"],
         "Priority-Aware": OK["purple"],
         "Deadline-Energy": OK["sky"],
+        "Energy-WSRPT": "#8c564b",
         "All-On-Board": OK["orange"],
         "All-Downlink": OK["red"],
     }
@@ -199,7 +200,9 @@ def plot_value(timeseries: pd.DataFrame, fig_dir: Path) -> None:
     max_by_seed = main.groupby("seed")["cum_value"].transform("max")
     main["norm_cum"] = main["cum_value"] / max_by_seed
     grid = np.linspace(0, 24, 121)
-    for policy in ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Priority-Aware", "Deadline-Energy", "Heuristic-TVD"]:
+    for policy in ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Priority-Aware", "Deadline-Energy", "Energy-WSRPT", "Heuristic-TVD"]:
+        if policy not in set(main["policy"]):
+            continue
         curves = []
         for _, seed_df in main[main["policy"] == policy].groupby("seed"):
             seed_df = seed_df.sort_values("arrival_h")
@@ -409,7 +412,7 @@ def write_tables(profile: pd.DataFrame, metrics: pd.DataFrame, out_dir: Path, he
     main = metrics[metrics["variant"] == "main"].copy()
     max_by_seed = main.groupby("seed")["total_value"].transform("max")
     main["normalized_value"] = main["total_value"] / max_by_seed
-    order = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Priority-Aware", "Deadline-Energy", "Heuristic-TVD"]
+    order = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Priority-Aware", "Deadline-Energy", "Energy-WSRPT", "Heuristic-TVD"]
     lines.append("\\newcommand{\\ActionMixRows}{%\n")
     for policy in order:
         rows = main[main["policy"] == policy]

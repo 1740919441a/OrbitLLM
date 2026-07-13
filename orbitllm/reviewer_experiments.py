@@ -18,9 +18,13 @@ from .config import ensure_output_dirs, load_config, resolve_project_path
 from .profile import load_profile, write_default_profile
 from .simulate import (
     ActionCost,
+    SOTA_BASELINE_POLICIES,
     Task,
     Window,
+    _drl_ua_state,
+    _leo_learning_state,
     choose_deadline_energy,
+    choose_energy_wsrpt,
     choose_fixed_threshold,
     choose_heuristic,
     choose_priority_aware,
@@ -29,6 +33,7 @@ from .simulate import (
     generate_windows,
     run_milp_bound,
     run_policy,
+    train_leo_drl_inspired,
     task_costs,
     value_at,
 )
@@ -331,6 +336,276 @@ def _physical_cfg(cfg: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def _physical_candidate_outcomes(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: PhysicalDownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> list[dict[str, float | str]]:
+    actions = ["ON", "PRE", "DOWN"] if allow_pre else ["ON", "DOWN"]
+    memory_limit = float(cfg["satellite"]["memory_gb"])
+    rows: list[dict[str, float | str]] = []
+    for action in actions:
+        cost = costs[action]
+        comm_energy = 0.0
+        if action == "ON":
+            completion = max(task.arrival_s, compute_ready_s) + cost.latency_s
+        elif action == "PRE":
+            pre_done = max(task.arrival_s, compute_ready_s) + cost.latency_s
+            completion, comm_energy, _ = scheduler.clone().schedule_energy(pre_done, cost.bits, commit=True)
+        else:
+            completion, comm_energy, _ = scheduler.clone().schedule_energy(task.arrival_s, cost.bits, commit=True)
+        total_energy = cost.energy_j + comm_energy
+        if cost.memory_gb > memory_limit or total_energy > energy_left:
+            continue
+        rows.append(
+            {
+                "action": action,
+                "completion_s": completion,
+                "delay_s": max(0.0, completion - task.arrival_s),
+                "realized": value_at(task, completion) * cost.value_factor,
+                "compute_energy_j": cost.energy_j,
+                "comm_energy_j": comm_energy,
+                "total_energy_j": total_energy,
+                "bits": cost.bits,
+                "memory_gb": cost.memory_gb,
+            }
+        )
+    return rows
+
+
+def choose_dpp_physical(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: PhysicalDownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    context: dict[str, Any],
+) -> str:
+    params = cfg.get("dpp_llm", {})
+    v_weight = float(params.get("v_weight", 6.0))
+    latency_weight = float(params.get("latency_weight", 0.20))
+    energy_queue = float(context.get("energy_queue", 0.0))
+    bandwidth_queue = float(context.get("bandwidth_queue", 0.0))
+    energy_quota = max(float(context.get("energy_quota_j", 1.0)), 1.0)
+    bandwidth_quota = max(float(context.get("bandwidth_quota_bits", 1.0)), 1.0)
+    candidates: list[tuple[float, str]] = []
+    for row in _physical_candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg):
+        value_ratio = float(row["realized"]) / max(task.value0, 1e-9)
+        delay_ratio = float(row["delay_s"]) / max(task.half_life_s, 1.0)
+        drift = (
+            energy_queue * float(row["total_energy_j"]) / energy_quota
+            + bandwidth_queue * float(row["bits"]) / bandwidth_quota
+        )
+        candidates.append((drift + v_weight * (latency_weight * delay_ratio - value_ratio), str(row["action"])))
+    return min(candidates)[1] if candidates else "DROP"
+
+
+def choose_active_inf_physical(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: PhysicalDownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> str:
+    params = cfg.get("active_inf", {})
+    expected_decode = max(float(np.mean(cfg["tasks"]["decode_tokens"])), 1.0)
+    decode_uncertainty = min(abs(task.decode_tokens - expected_decode) / expected_decode, 2.0)
+    energy_budget = max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+    memory_limit = max(float(cfg["satellite"]["memory_gb"]), 1e-9)
+    candidates: list[tuple[float, str]] = []
+    for row in _physical_candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg):
+        action = str(row["action"])
+        value_ratio = float(row["realized"]) / max(task.value0, 1e-9)
+        delay_ratio = float(row["delay_s"]) / max(task.half_life_s, 1.0)
+        if action == "ON":
+            ambiguity = decode_uncertainty * float(row["memory_gb"]) / memory_limit
+        elif action == "PRE":
+            ambiguity = 0.5 * decode_uncertainty + (1.0 - costs["PRE"].value_factor)
+        else:
+            ambiguity = min(delay_ratio, 2.0)
+        preference = (
+            float(params.get("value_weight", 1.0)) * value_ratio
+            - float(params.get("latency_weight", 0.35)) * delay_ratio
+            - float(params.get("energy_weight", 0.25)) * float(row["total_energy_j"]) / energy_budget
+            - float(params.get("bandwidth_weight", 0.20)) * float(row["bits"]) / max(task.data_bits, 1.0)
+        )
+        candidates.append((-preference + float(params.get("ambiguity_weight", 0.30)) * ambiguity, action))
+    return min(candidates)[1] if candidates else "DROP"
+
+
+def choose_hierarchical_ra_physical(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: PhysicalDownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> str:
+    """Physical-link counterpart of the hierarchical resource-allocation projection."""
+    params = cfg.get("hierarchical_ra", {})
+    delay_weight = float(params.get("delay_weight", 0.30))
+    energy_weight = float(params.get("energy_weight", 0.22))
+    bandwidth_weight = float(params.get("bandwidth_weight", 0.18))
+    energy_budget = max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+    outcomes = _physical_candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg)
+    if not outcomes:
+        return "DROP"
+
+    def score(row: dict[str, float | str]) -> float:
+        return (
+            float(row["realized"]) / max(task.value0, 1e-9)
+            - delay_weight * float(row["delay_s"]) / max(task.half_life_s, 1.0)
+            - energy_weight * float(row["total_energy_j"]) / energy_budget
+            - bandwidth_weight * float(row["bits"]) / max(task.data_bits, 1.0)
+        )
+
+    local = [row for row in outcomes if row["action"] == "ON"]
+    transmit = [row for row in outcomes if row["action"] in {"PRE", "DOWN"}]
+    best_local = max(local, key=score) if local else None
+    best_transmit = max(transmit, key=score) if transmit else None
+    if best_local is None:
+        return str(best_transmit["action"]) if best_transmit is not None else "DROP"
+    if best_transmit is None or score(best_local) >= score(best_transmit):
+        return "ON"
+    return str(best_transmit["action"])
+
+
+def choose_qos_multihop_projected_physical(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: PhysicalDownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> str:
+    """Single-hop QoS projection with physical RF energy in the action score."""
+    params = cfg.get("qos_multihop", {})
+    deadline_s = float(params.get("deadline_factor", 1.0)) * task.half_life_s
+    congestion_weight = float(params.get("congestion_weight", 0.50))
+    lateness_weight = float(params.get("lateness_weight", 1.35))
+    value_weight = float(params.get("value_weight", 0.80))
+    link_load = scheduler.used_total / max(scheduler.capacity_total, 1.0)
+    candidates: list[tuple[float, str]] = []
+    for row in _physical_candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg):
+        delay_ratio = float(row["delay_s"]) / max(deadline_s, 1.0)
+        qos_violation = max(0.0, delay_ratio - 1.0)
+        route_load = float(row["bits"]) / max(task.data_bits, 1.0)
+        objective = delay_ratio + lateness_weight * qos_violation + congestion_weight * link_load * route_load - value_weight * float(row["realized"]) / max(task.value0, 1e-9)
+        candidates.append((objective, str(row["action"])))
+    return min(candidates)[1] if candidates else "DROP"
+
+
+def choose_delay_cost_physical(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: PhysicalDownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> str:
+    """Delay--cost adaptation that prices both compute and RF energy."""
+    params = cfg.get("delay_cost", {})
+    delay_weight = float(params.get("delay_weight", 0.62))
+    energy_weight = float(params.get("energy_weight", 0.20))
+    bandwidth_weight = float(params.get("bandwidth_weight", 0.18))
+    urgency = max(0.35, min(2.0, 30.0 * 60.0 / max(task.half_life_s, 1.0)))
+    energy_budget = max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+    candidates: list[tuple[float, str]] = []
+    for row in _physical_candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg):
+        objective = (
+            delay_weight * urgency * float(row["delay_s"]) / max(task.half_life_s, 1.0)
+            + energy_weight * float(row["total_energy_j"]) / energy_budget
+            + bandwidth_weight * float(row["bits"]) / max(task.data_bits, 1.0)
+            - float(row["realized"]) / max(task.value0, 1e-9)
+        )
+        candidates.append((objective, str(row["action"])))
+    return min(candidates)[1] if candidates else "DROP"
+
+
+def choose_leo_drl_physical(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: PhysicalDownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    context: dict[str, Any],
+) -> tuple[str, tuple[int, int, int, int, int, int]]:
+    state = _leo_learning_state(task, scheduler, compute_ready_s, energy_left, cfg)
+    outcomes = {
+        str(row["action"]): row
+        for row in _physical_candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg)
+    }
+    feasible = list(outcomes)
+    if not feasible:
+        return "DROP", state
+    q_table: dict[tuple[tuple[int, ...], str], float] = context.setdefault("q_table", {})
+    training = bool(context.get("training", False))
+    epsilon = float(context.get("epsilon", cfg.get("leo_drl", {}).get("epsilon", 0.15))) if training else 0.0
+    rng: np.random.Generator = context.setdefault("rng", np.random.default_rng(20260713))
+    if training and float(rng.random()) < epsilon:
+        return str(rng.choice(feasible)), state
+    ranked = sorted(
+        ((float(q_table.get((state, action), 0.0)), action) for action in feasible),
+        key=lambda item: (item[0], item[1]),
+        reverse=True,
+    )
+    if ranked and ranked[0][0] != 0.0:
+        return ranked[0][1], state
+    return max(
+        feasible,
+        key=lambda action: (
+            float(outcomes[action]["realized"]) / max(task.value0, 1e-9)
+            - 0.25 * float(outcomes[action]["delay_s"]) / max(task.half_life_s, 1.0)
+            - 0.15 * float(outcomes[action]["total_energy_j"])
+            / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+            - 0.10 * float(outcomes[action]["bits"]) / max(task.data_bits, 1.0)
+        ),
+    ), state
+
+
+def choose_drl_ua_physical(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: PhysicalDownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    context: dict[str, Any],
+) -> tuple[str, tuple[int, ...]]:
+    """Physical-link Q-learning projection of DRL user association/offloading."""
+    state = _drl_ua_state(task, scheduler, compute_ready_s, energy_left, cfg)
+    outcomes = {str(row["action"]): row for row in _physical_candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg)}
+    feasible = list(outcomes)
+    if not feasible:
+        return "DROP", state
+    q_table: dict[tuple[tuple[int, ...], str], float] = context.setdefault("q_table", {})
+    training = bool(context.get("training", False))
+    epsilon = float(context.get("epsilon", cfg.get("drl_ua", {}).get("epsilon", 0.15))) if training else 0.0
+    rng: np.random.Generator = context.setdefault("rng", np.random.default_rng(20260714))
+    if training and float(rng.random()) < epsilon:
+        return str(rng.choice(feasible)), state
+    ranked = sorted(((float(q_table.get((state, action), 0.0)), action) for action in feasible), key=lambda item: (item[0], item[1]), reverse=True)
+    if ranked and ranked[0][0] != 0.0:
+        return ranked[0][1], state
+    return max(
+        feasible,
+        key=lambda action: (
+            float(outcomes[action]["realized"]) / max(task.value0, 1e-9)
+            - 0.30 * float(outcomes[action]["delay_s"]) / max(task.half_life_s, 1.0)
+            - 0.12 * float(outcomes[action]["total_energy_j"]) / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+            - 0.16 * float(outcomes[action]["bits"]) / max(task.data_bits, 1.0)
+        ),
+    ), state
+
+
 def choose_heuristic_physical(
     task: Task,
     costs: dict[str, ActionCost],
@@ -372,10 +647,18 @@ def choose_heuristic_physical(
             + lambda_bandwidth * cost.bits / max(task.data_bits, 1.0)
         )
         candidates.append((density, action))
-    return max(candidates)[1] if candidates else "DOWN"
+    return max(candidates)[1] if candidates else "DROP"
 
 
-def run_policy_physical(policy: str, tasks: list[Task], windows: list[Window], profile: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, float | str | int]:
+def run_policy_physical(
+    policy: str,
+    tasks: list[Task],
+    windows: list[Window],
+    profile: pd.DataFrame,
+    cfg: dict[str, Any],
+    *,
+    policy_context: dict[str, Any] | None = None,
+) -> dict[str, float | str | int]:
     horizon_s = cfg["horizon_h"] * 3600.0
     params = _physical_cfg(cfg)
     scheduler = PhysicalDownlinkScheduler(windows, horizon_s, **params)
@@ -388,8 +671,16 @@ def run_policy_physical(policy: str, tasks: list[Task], windows: list[Window], p
     raw_bits = sum(t.data_bits for t in tasks)
     oom_count = 0
     energy_violation_count = 0
-    for task in tasks:
+    decision_times_ms: list[float] = []
+    context = policy_context if policy_context is not None else {}
+    if policy == "DPP-LLM":
+        context.setdefault("energy_queue", 0.0)
+        context.setdefault("bandwidth_queue", 0.0)
+        context["energy_quota_j"] = float(cfg["satellite"]["energy_budget_j"]) / max(len(tasks), 1)
+        context["bandwidth_quota_bits"] = scheduler.capacity_total / max(len(tasks), 1)
+    for task_idx, task in enumerate(tasks):
         costs = task_costs(task, profile, cfg)
+        t_decision = time.perf_counter()
         if policy == "All-Downlink":
             action = "DOWN"
         elif policy == "All-On-Board":
@@ -401,10 +692,33 @@ def run_policy_physical(policy: str, tasks: list[Task], windows: list[Window], p
             action = choose_deadline_energy(task, costs, scheduler, compute_ready_s, energy_left, cfg)  # type: ignore[arg-type]
         elif policy == "Priority-Aware":
             action = choose_priority_aware(task, costs, energy_left, cfg)
+        elif policy == "Energy-WSRPT":
+            action = choose_energy_wsrpt(task, costs, scheduler, compute_ready_s, energy_left, cfg)
+        elif policy == "DPP-LLM":
+            action = choose_dpp_physical(task, costs, scheduler, compute_ready_s, energy_left, cfg, context)
+        elif policy == "ActiveInf-inspired":
+            action = choose_active_inf_physical(task, costs, scheduler, compute_ready_s, energy_left, cfg)
+        elif policy == "LEO-DRL-inspired":
+            action, learning_state = choose_leo_drl_physical(
+                task, costs, scheduler, compute_ready_s, energy_left, cfg, context
+            )
+            context["learning_state"] = learning_state
+        elif policy == "DRL-UA-inspired":
+            action, learning_state = choose_drl_ua_physical(
+                task, costs, scheduler, compute_ready_s, energy_left, cfg, context
+            )
+            context["learning_state"] = learning_state
+        elif policy == "Hierarchical-RA-inspired":
+            action = choose_hierarchical_ra_physical(task, costs, scheduler, compute_ready_s, energy_left, cfg)
+        elif policy == "QoS-Multihop-projected":
+            action = choose_qos_multihop_projected_physical(task, costs, scheduler, compute_ready_s, energy_left, cfg)
+        elif policy == "DelayCost-adapted":
+            action = choose_delay_cost_physical(task, costs, scheduler, compute_ready_s, energy_left, cfg)
         else:
             action = choose_heuristic_physical(task, costs, scheduler, compute_ready_s, energy_left, cfg)
-        cost = costs[action]
-        if cost.memory_gb > float(cfg["satellite"]["memory_gb"]):
+        decision_times_ms.append((time.perf_counter() - t_decision) * 1000.0)
+        cost = costs[action] if action != "DROP" else ActionCost(0, 0, 0, 0, 0)
+        if action != "DROP" and cost.memory_gb > float(cfg["satellite"]["memory_gb"]):
             oom_count += 1
             action = "DOWN"
             cost = costs[action]
@@ -428,6 +742,7 @@ def run_policy_physical(policy: str, tasks: list[Task], windows: list[Window], p
                 action = "DROP"
                 cost = ActionCost(0, 0, 0, 0, 0)
 
+        action_total_energy = 0.0
         if action == "DROP":
             completion = horizon_s + 12 * 3600.0
             realized = 0.0
@@ -436,6 +751,7 @@ def run_policy_physical(policy: str, tasks: list[Task], windows: list[Window], p
             compute_ready_s = completion
             energy_left -= cost.energy_j
             compute_energy += cost.energy_j
+            action_total_energy = cost.energy_j
             realized = value_at(task, completion)
         elif action == "PRE":
             pre_done = max(task.arrival_s, compute_ready_s) + cost.latency_s
@@ -443,11 +759,48 @@ def run_policy_physical(policy: str, tasks: list[Task], windows: list[Window], p
             completion, comm_e, _ = scheduler.schedule_energy(pre_done, cost.bits, commit=True)
             energy_left -= cost.energy_j + comm_e
             compute_energy += cost.energy_j
+            action_total_energy = cost.energy_j + comm_e
             realized = value_at(task, completion) * cost.value_factor
         else:
             completion, comm_e, _ = scheduler.schedule_energy(task.arrival_s, cost.bits, commit=True)
             energy_left -= comm_e
+            action_total_energy = comm_e
             realized = value_at(task, completion)
+
+        if policy == "DPP-LLM":
+            context["energy_queue"] = max(
+                0.0,
+                float(context["energy_queue"])
+                + action_total_energy / max(float(context["energy_quota_j"]), 1.0)
+                - 1.0,
+            )
+            context["bandwidth_queue"] = max(
+                0.0,
+                float(context["bandwidth_queue"])
+                + cost.bits / max(float(context["bandwidth_quota_bits"]), 1.0)
+                - 1.0,
+            )
+        if policy in {"LEO-DRL-inspired", "DRL-UA-inspired"} and bool(context.get("training", False)):
+            state = context.get("learning_state")
+            if state is not None:
+                q_table = context.setdefault("q_table", {})
+                reward = (
+                    realized / max(task.value0, 1e-9)
+                    - 0.25 * max(0.0, completion - task.arrival_s) / max(task.half_life_s, 1.0)
+                    - 0.15 * action_total_energy / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+                    - 0.10 * cost.bits / max(task.data_bits, 1.0)
+                )
+                next_max = 0.0
+                if task_idx + 1 < len(tasks):
+                    state_fn = _drl_ua_state if policy == "DRL-UA-inspired" else _leo_learning_state
+                    next_state = state_fn(tasks[task_idx + 1], scheduler, compute_ready_s, energy_left, cfg)
+                    next_max = max(float(q_table.get((next_state, a), 0.0)) for a in ("ON", "PRE", "DOWN"))
+                key = (state, action)
+                learning_cfg = cfg.get("drl_ua" if policy == "DRL-UA-inspired" else "leo_drl", {})
+                alpha = float(learning_cfg.get("alpha", 0.25))
+                gamma = float(learning_cfg.get("gamma", 0.90))
+                old_q = float(q_table.get(key, 0.0))
+                q_table[key] = old_q + alpha * (reward + gamma * next_max - old_q)
         action_counts[action] += 1
         total_value += realized
         latencies.append(max(0.0, completion - task.arrival_s) / 60.0)
@@ -476,6 +829,9 @@ def run_policy_physical(policy: str, tasks: list[Task], windows: list[Window], p
         "down_pct": 100.0 * action_counts["DOWN"] / max(len(tasks), 1),
         "drop_pct": 100.0 * action_counts["DROP"] / max(len(tasks), 1),
         "residual_energy_j": energy_left,
+        "mean_decision_ms": float(np.mean(decision_times_ms)) if decision_times_ms else 0.0,
+        "dpp_energy_queue_final": float(context.get("energy_queue", np.nan)),
+        "dpp_bandwidth_queue_final": float(context.get("bandwidth_queue", np.nan)),
     }
 
 
@@ -527,6 +883,135 @@ def run_physical_link(args: argparse.Namespace) -> None:
     mix.to_csv(resolve_project_path(args.mix_output), index=False)
     contacts.to_csv(resolve_project_path(args.contact_output), index=False)
     print(f"wrote physical link metrics {out} rows={len(df)}", flush=True)
+
+
+def _train_leo_drl_physical(
+    cfg: dict[str, Any],
+    profile: pd.DataFrame,
+    windows: list[Window],
+) -> dict[str, Any]:
+    params = cfg.get("leo_drl", {})
+    train_seeds = [int(seed) for seed in params.get("training_seeds", [])]
+    context: dict[str, Any] = {
+        "training": True,
+        "epsilon": float(params.get("epsilon", 0.15)),
+        "q_table": {},
+        "rng": np.random.default_rng(20260713),
+        "training_seeds": tuple(train_seeds),
+    }
+    for _ in range(max(1, int(params.get("training_epochs", 1)))):
+        for seed in train_seeds:
+            tasks = generate_tasks(cfg, seed)
+            run_policy_physical(
+                "LEO-DRL-inspired", tasks, windows, profile, cfg, policy_context=context
+            )
+    context["training"] = False
+    context["epsilon"] = 0.0
+    return context
+
+
+def _train_drl_ua_physical(
+    cfg: dict[str, Any],
+    profile: pd.DataFrame,
+    windows: list[Window],
+) -> dict[str, Any]:
+    params = cfg.get("drl_ua", {})
+    train_seeds = [int(seed) for seed in params.get("training_seeds", cfg.get("leo_drl", {}).get("training_seeds", []))]
+    context: dict[str, Any] = {
+        "training": True,
+        "epsilon": float(params.get("epsilon", 0.15)),
+        "q_table": {},
+        "rng": np.random.default_rng(20260714),
+        "training_seeds": tuple(train_seeds),
+    }
+    for _ in range(max(1, int(params.get("training_epochs", 4)))):
+        for seed in train_seeds:
+            tasks = generate_tasks(cfg, seed)
+            run_policy_physical("DRL-UA-inspired", tasks, windows, profile, cfg, policy_context=context)
+    context["training"] = False
+    context["epsilon"] = 0.0
+    return context
+
+
+def run_sota_physical_link(args: argparse.Namespace) -> None:
+    cfg = load_config(args.config)
+    ensure_output_dirs(cfg)
+    cfg["physical_link"] = {
+        "radio_circuit_w": args.radio_circuit_w,
+        "pa_static_w": args.pa_static_w,
+        "pa_peak_w": args.pa_peak_w,
+        "pa_efficiency": args.pa_efficiency,
+    }
+    profile_path = args.profile or cfg["profile_path"]
+    if not resolve_project_path(profile_path).exists():
+        write_default_profile(profile_path)
+    profile = load_profile(profile_path)
+    windows, contacts = generate_tle_windows(cfg)
+    learned = _train_leo_drl_physical(cfg, profile, windows)
+    ua_learned = _train_drl_ua_physical(cfg, profile, windows)
+    rows: list[dict[str, float | str | int]] = []
+    for seed in cfg["seeds"]:
+        tasks = generate_tasks(cfg, int(seed))
+        for policy in SOTA_BASELINE_POLICIES:
+            context = None
+            if policy == "LEO-DRL-inspired":
+                context = {
+                    "training": False,
+                    "epsilon": 0.0,
+                    "q_table": learned["q_table"],
+                }
+            elif policy == "DRL-UA-inspired":
+                context = {
+                    "training": False,
+                    "epsilon": 0.0,
+                    "q_table": ua_learned["q_table"],
+                }
+            metrics = run_policy_physical(
+                policy, tasks, windows, profile, cfg, policy_context=context
+            )
+            metrics.update(
+                {
+                    "seed": seed,
+                    "contact_model": "tle-elevation-dynamic-rf-energy",
+                    "window_count": len(windows),
+                    "capacity_gbit": sum(w.capacity_bits for w in windows) / 1e9,
+                    "training_seed_count": len(learned["training_seeds"]),
+                    "training_q_states": len(learned["q_table"]),
+                    "ua_training_seed_count": len(ua_learned["training_seeds"]),
+                    "ua_training_q_states": len(ua_learned["q_table"]),
+                }
+            )
+            rows.append(metrics)
+    df = pd.DataFrame(rows)
+    df["normalized_value"] = df.groupby("seed")["total_value"].transform(
+        lambda values: values / max(float(values.max()), 1e-9)
+    )
+    out = resolve_project_path(args.output)
+    df.to_csv(out, index=False)
+    summary = (
+        df.groupby("policy", as_index=False)[
+            [
+                "normalized_value",
+                "total_value",
+                "compute_energy_j",
+                "comm_energy_j",
+                "energy_j",
+                "median_latency_min",
+                "on_pct",
+                "pre_pct",
+                "down_pct",
+                "drop_pct",
+                "mean_decision_ms",
+                "oom_count",
+                "energy_violation_count",
+            ]
+        ]
+        .mean()
+        .sort_values("normalized_value", ascending=False)
+    )
+    summary.to_csv(resolve_project_path(args.summary_output), index=False)
+    contacts.to_csv(resolve_project_path(args.contact_output), index=False)
+    print(f"wrote SOTA physical-link metrics {out} rows={len(df)}", flush=True)
 
 
 def _sample_decode_uncertainty(tasks: list[Task], seed: int) -> list[int]:
@@ -960,6 +1445,18 @@ def main(argv: list[str] | None = None) -> int:
     phy.add_argument("--mix-output", default="results/physical_link_action_mix.csv")
     phy.add_argument("--contact-output", default="results/physical_link_tle_contacts.csv")
     phy.set_defaults(func=run_physical_link)
+
+    sota_phy = sub.add_parser("sota-physical-link")
+    sota_phy.add_argument("--config", default=None)
+    sota_phy.add_argument("--profile", default=None)
+    sota_phy.add_argument("--radio-circuit-w", type=float, default=6.0)
+    sota_phy.add_argument("--pa-static-w", type=float, default=2.0)
+    sota_phy.add_argument("--pa-peak-w", type=float, default=16.0)
+    sota_phy.add_argument("--pa-efficiency", type=float, default=0.35)
+    sota_phy.add_argument("--output", default="results/sota_baseline_physical_link_metrics.csv")
+    sota_phy.add_argument("--summary-output", default="results/sota_baseline_physical_link_summary.csv")
+    sota_phy.add_argument("--contact-output", default="results/sota_baseline_physical_link_contacts.csv")
+    sota_phy.set_defaults(func=run_sota_physical_link)
 
     guard = sub.add_parser("guardband-cap")
     guard.add_argument("--config", default=None)

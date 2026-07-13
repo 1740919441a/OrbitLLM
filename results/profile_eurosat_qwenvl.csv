@@ -1,0 +1,2 @@
+model,scale_b,quant,context_len,prefill_tokens,decode_tokens,prefill_j_per_tok,decode_j_per_tok,tokens_per_sec,peak_mem_gb,gpu_power_w,seed,run_id
+Qwen2.5-VL-3B-Instruct (SkyScript-measured),3.0,FP16,26,1,25,8.151899025805163,3.5066626248017863,30.79670855389104,7.057296180725098,118.307325768742,0,vlm_4090_mean

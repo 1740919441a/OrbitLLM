@@ -40,6 +40,9 @@ class Task:
     prefill_tokens: int
     decode_tokens: int
     kind: str
+    pre_retention_fraction: float | None = None
+    pre_value_factor: float | None = None
+    source_id: str | None = None
 
     @property
     def context_len(self) -> int:
@@ -287,14 +290,33 @@ def task_costs(
     on_latency = tokens / max(float(row["tokens_per_sec"]), 1e-6)
     on_latency *= float(sat.get("profile_latency_scale", 1.0))
     mem = float(row["peak_mem_gb"])
+    # A calibrated PRE selector can replace the legacy fractional proxy.
+    # Its retained-bit and utility factors stay configurable for sensitivity sweeps.
+    pre_profile = sat.get("pre_profile")
+    if pre_profile:
+        pre_energy = float(pre_profile["active_energy_j_per_task"])
+        pre_latency = float(pre_profile["latency_s_per_task"])
+        pre_memory = float(pre_profile["peak_mem_gb"])
+    else:
+        pre_energy = on_energy * float(sat.get("pre_energy_fraction", 0.18))
+        pre_latency = on_latency * float(sat.get("pre_latency_fraction", 0.18))
+        pre_memory = min(mem, mem * 0.35 + 0.45)
     return {
         "ON": ActionCost(on_energy, on_latency, mem, 0.0, 1.0),
         "PRE": ActionCost(
-            on_energy * sat["pre_energy_fraction"],
-            on_latency * sat["pre_latency_fraction"],
-            min(mem, mem * 0.35 + 0.45),
-            task.data_bits * sat["pre_retention_fraction"],
-            sat["pre_value_fraction"],
+            pre_energy,
+            pre_latency,
+            pre_memory,
+            task.data_bits * (
+                float(task.pre_retention_fraction)
+                if task.pre_retention_fraction is not None
+                else float(sat["pre_retention_fraction"])
+            ),
+            (
+                float(task.pre_value_factor)
+                if task.pre_value_factor is not None
+                else float(sat["pre_value_fraction"])
+            ),
         ),
         "DOWN": ActionCost(0.0, 0.0, 0.0, task.data_bits, 1.0),
     }
@@ -479,6 +501,444 @@ def choose_energy_wsrpt(
     return min(candidates)[1]
 
 
+def _candidate_outcomes(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> list[dict[str, float | str]]:
+    actions = ["ON", "PRE", "DOWN"] if allow_pre else ["ON", "DOWN"]
+    memory_limit = float(cfg["satellite"]["memory_gb"])
+    outcomes: list[dict[str, float | str]] = []
+    for action in actions:
+        cost = costs[action]
+        if action in {"ON", "PRE"} and (cost.memory_gb > memory_limit or cost.energy_j > energy_left):
+            continue
+        if action == "ON":
+            completion = max(task.arrival_s, compute_ready_s) + cost.latency_s
+        elif action == "PRE":
+            pre_done = max(task.arrival_s, compute_ready_s) + cost.latency_s
+            completion = scheduler.clone().schedule(pre_done, cost.bits, commit=True)
+        else:
+            completion = scheduler.clone().schedule(task.arrival_s, cost.bits, commit=True)
+        delay_s = max(0.0, completion - task.arrival_s)
+        outcomes.append(
+            {
+                "action": action,
+                "completion_s": completion,
+                "delay_s": delay_s,
+                "realized": value_at(task, completion) * cost.value_factor,
+                "energy_j": cost.energy_j,
+                "bits": cost.bits,
+                "memory_gb": cost.memory_gb,
+            }
+        )
+    return outcomes
+
+
+def choose_dpp_llm(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> str:
+    """LLM-aware drift-plus-penalty adaptation of satellite DPP offloading."""
+    params = cfg.get("dpp_llm", {})
+    v_weight = float(params.get("v_weight", 6.0))
+    latency_weight = float(params.get("latency_weight", 0.20))
+    energy_queue = float(context.get("energy_queue", 0.0))
+    bandwidth_queue = float(context.get("bandwidth_queue", 0.0))
+    energy_quota = max(float(context.get("energy_quota_j", 1.0)), 1.0)
+    bandwidth_quota = max(float(context.get("bandwidth_quota_bits", 1.0)), 1.0)
+    candidates: list[tuple[float, str]] = []
+    for row in _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre):
+        value_ratio = float(row["realized"]) / max(task.value0, 1e-9)
+        delay_ratio = float(row["delay_s"]) / max(task.half_life_s, 1.0)
+        energy_load = float(row["energy_j"]) / energy_quota
+        bandwidth_load = float(row["bits"]) / bandwidth_quota
+        drift_penalty = energy_queue * energy_load + bandwidth_queue * bandwidth_load
+        utility_penalty = v_weight * (latency_weight * delay_ratio - value_ratio)
+        candidates.append((drift_penalty + utility_penalty, str(row["action"])))
+    return min(candidates)[1] if candidates else "DOWN"
+
+
+def choose_active_inf_inspired(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> str:
+    """One-step expected-free-energy surrogate, not a reproduction of He et al."""
+    params = cfg.get("active_inf", {})
+    w_value = float(params.get("value_weight", 1.0))
+    w_latency = float(params.get("latency_weight", 0.35))
+    w_energy = float(params.get("energy_weight", 0.25))
+    w_bandwidth = float(params.get("bandwidth_weight", 0.20))
+    w_ambiguity = float(params.get("ambiguity_weight", 0.30))
+    expected_decode = max(float(np.mean(cfg["tasks"]["decode_tokens"])), 1.0)
+    decode_uncertainty = min(abs(task.decode_tokens - expected_decode) / expected_decode, 2.0)
+    energy_budget = max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+    memory_limit = max(float(cfg["satellite"]["memory_gb"]), 1e-9)
+    candidates: list[tuple[float, str]] = []
+    for row in _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre):
+        action = str(row["action"])
+        value_ratio = float(row["realized"]) / max(task.value0, 1e-9)
+        delay_ratio = float(row["delay_s"]) / max(task.half_life_s, 1.0)
+        energy_ratio = float(row["energy_j"]) / energy_budget
+        bandwidth_ratio = float(row["bits"]) / max(task.data_bits, 1.0)
+        if action == "ON":
+            ambiguity = decode_uncertainty * float(row["memory_gb"]) / memory_limit
+        elif action == "PRE":
+            ambiguity = 0.5 * decode_uncertainty + (1.0 - costs["PRE"].value_factor)
+        else:
+            ambiguity = min(delay_ratio, 2.0)
+        preference = w_value * value_ratio - w_latency * delay_ratio - w_energy * energy_ratio - w_bandwidth * bandwidth_ratio
+        expected_free_energy = -preference + w_ambiguity * ambiguity
+        candidates.append((expected_free_energy, action))
+    return min(candidates)[1] if candidates else "DOWN"
+
+
+def choose_hierarchical_ra_inspired(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> str:
+    """Two-level LEO resource-allocation projection inspired by Gao et al.
+
+    The source problem jointly optimizes multi-node association and resource
+    allocation. OrbitLLM has one on-board accelerator and one ground path, so
+    the upper level selects a local-compute or transmission domain, while the
+    lower level selects PRE versus raw DOWN inside the transmission domain.
+    """
+    params = cfg.get("hierarchical_ra", {})
+    delay_weight = float(params.get("delay_weight", 0.30))
+    energy_weight = float(params.get("energy_weight", 0.22))
+    bandwidth_weight = float(params.get("bandwidth_weight", 0.18))
+    energy_budget = max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+    outcomes = _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre)
+    if not outcomes:
+        return "DOWN"
+
+    def score(row: dict[str, float | str]) -> float:
+        return (
+            float(row["realized"]) / max(task.value0, 1e-9)
+            - delay_weight * float(row["delay_s"]) / max(task.half_life_s, 1.0)
+            - energy_weight * float(row["energy_j"]) / energy_budget
+            - bandwidth_weight * float(row["bits"]) / max(task.data_bits, 1.0)
+        )
+
+    local = [row for row in outcomes if row["action"] == "ON"]
+    transmit = [row for row in outcomes if row["action"] in {"PRE", "DOWN"}]
+    best_local = max(local, key=score) if local else None
+    best_transmit = max(transmit, key=score) if transmit else None
+    if best_local is None:
+        return str(best_transmit["action"]) if best_transmit is not None else "DOWN"
+    if best_transmit is None or score(best_local) >= score(best_transmit):
+        return "ON"
+    return str(best_transmit["action"])
+
+
+def choose_qos_multihop_projected(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> str:
+    """Single-satellite QoS projection of a multihop offloading controller.
+
+    The current simulator has no relay satellite or ISL routing state. This
+    policy therefore preserves the source family\'s QoS and congestion-aware
+    selection logic but projects routes to the available ground path.
+    """
+    params = cfg.get("qos_multihop", {})
+    deadline_factor = float(params.get("deadline_factor", 1.0))
+    congestion_weight = float(params.get("congestion_weight", 0.50))
+    lateness_weight = float(params.get("lateness_weight", 1.35))
+    value_weight = float(params.get("value_weight", 0.80))
+    link_load = scheduler.used_total / max(scheduler.capacity_total, 1.0)
+    deadline_s = deadline_factor * task.half_life_s
+    candidates: list[tuple[float, str]] = []
+    for row in _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre):
+        delay_ratio = float(row["delay_s"]) / max(deadline_s, 1.0)
+        qos_violation = max(0.0, delay_ratio - 1.0)
+        route_load = float(row["bits"]) / max(task.data_bits, 1.0)
+        objective = (
+            delay_ratio
+            + lateness_weight * qos_violation
+            + congestion_weight * link_load * route_load
+            - value_weight * float(row["realized"]) / max(task.value0, 1e-9)
+        )
+        candidates.append((objective, str(row["action"])))
+    return min(candidates)[1] if candidates else "DOWN"
+
+
+def choose_delay_cost_adapted(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> str:
+    """Delay--cost emergency-offloading adaptation inspired by Li et al."""
+    params = cfg.get("delay_cost", {})
+    delay_weight = float(params.get("delay_weight", 0.62))
+    energy_weight = float(params.get("energy_weight", 0.20))
+    bandwidth_weight = float(params.get("bandwidth_weight", 0.18))
+    urgency = max(0.35, min(2.0, 30.0 * 60.0 / max(task.half_life_s, 1.0)))
+    energy_budget = max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+    candidates: list[tuple[float, str]] = []
+    for row in _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre):
+        delay_cost = urgency * float(row["delay_s"]) / max(task.half_life_s, 1.0)
+        resource_cost = (
+            energy_weight * float(row["energy_j"]) / energy_budget
+            + bandwidth_weight * float(row["bits"]) / max(task.data_bits, 1.0)
+        )
+        utility_credit = float(row["realized"]) / max(task.value0, 1e-9)
+        candidates.append((delay_weight * delay_cost + resource_cost - utility_credit, str(row["action"])))
+    return min(candidates)[1] if candidates else "DOWN"
+
+
+def choose_eh_dora_adapted(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> str:
+    """Energy-harvesting dynamic offloading/resource-allocation adaptation.
+
+    This is an OrbitLLM-interface adaptation, not a reproduction of Song et
+    al.  It prices the post-action battery state against near-term harvest and
+    an eclipse reserve while retaining the common ON/PRE/DOWN action costs.
+    """
+    params = cfg.get("eh_dora", {})
+    value_weight = float(params.get("value_weight", 1.0))
+    latency_weight = float(params.get("latency_weight", 0.30))
+    energy_weight = float(params.get("energy_weight", 0.25))
+    bandwidth_weight = float(params.get("bandwidth_weight", 0.15))
+    reserve_weight = float(params.get("reserve_weight", 0.80))
+    reserve_fraction = float(params.get("reserve_fraction", 0.20))
+    battery_capacity = max(
+        float(cfg.get("soc", {}).get("battery_capacity_j", cfg["satellite"]["energy_budget_j"])),
+        1.0,
+    )
+    lookahead_s = float(params.get("harvest_lookahead_min", 90.0)) * 60.0
+    expected_harvest = solar_recharge_j(cfg, task.arrival_s, task.arrival_s + lookahead_s)
+    available_energy = min(battery_capacity, energy_left + expected_harvest)
+    reserve_j = reserve_fraction * battery_capacity
+    candidates: list[tuple[float, str]] = []
+    for row in _candidate_outcomes(
+        task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre
+    ):
+        action = str(row["action"])
+        post_harvest_energy = min(
+            battery_capacity,
+            energy_left - float(row["energy_j"]) + expected_harvest,
+        )
+        reserve_shortfall = max(0.0, reserve_j - post_harvest_energy) / battery_capacity
+        score = (
+            value_weight * float(row["realized"]) / max(task.value0, 1e-9)
+            - latency_weight * float(row["delay_s"]) / max(task.half_life_s, 1.0)
+            - energy_weight * float(row["energy_j"]) / max(available_energy, 1.0)
+            - bandwidth_weight * float(row["bits"]) / max(task.data_bits, 1.0)
+            - reserve_weight * reserve_shortfall
+        )
+        candidates.append((score, action))
+    return max(candidates)[1] if candidates else "DOWN"
+
+
+def choose_peakmem_inspired(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> str:
+    """Peak-memory-aware inference scheduling projection.
+
+    The source JSA work partitions multi-tenant DNN inference.  OrbitLLM has a
+    single non-preemptive accelerator, so this projection uses peak-memory and
+    decode-growth pressure to rank otherwise feasible ON/PRE/DOWN outcomes.
+    """
+    params = cfg.get("peakmem", {})
+    value_weight = float(params.get("value_weight", 1.0))
+    latency_weight = float(params.get("latency_weight", 0.28))
+    memory_weight = float(params.get("memory_weight", 0.55))
+    decode_weight = float(params.get("decode_weight", 0.25))
+    energy_weight = float(params.get("energy_weight", 0.12))
+    bandwidth_weight = float(params.get("bandwidth_weight", 0.12))
+    memory_limit = max(float(cfg["satellite"]["memory_gb"]), 1e-9)
+    max_decode = max(float(v) for v in cfg["tasks"].get("decode_tokens", [task.decode_tokens]))
+    candidates: list[tuple[float, str]] = []
+    for row in _candidate_outcomes(
+        task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre
+    ):
+        action = str(row["action"])
+        memory_pressure = float(row["memory_gb"]) / memory_limit
+        decode_pressure = (
+            task.decode_tokens / max(max_decode, 1.0) * memory_pressure
+            if action in {"ON", "PRE"}
+            else 0.0
+        )
+        score = (
+            value_weight * float(row["realized"]) / max(task.value0, 1e-9)
+            - latency_weight * float(row["delay_s"]) / max(task.half_life_s, 1.0)
+            - memory_weight * memory_pressure
+            - decode_weight * decode_pressure
+            - energy_weight * float(row["energy_j"]) / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+            - bandwidth_weight * float(row["bits"]) / max(task.data_bits, 1.0)
+        )
+        candidates.append((score, action))
+    return max(candidates)[1] if candidates else "DOWN"
+
+
+def _leo_learning_state(
+    task: Task,
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> tuple[int, int, int, int, int, int]:
+    value_low, value_high = [float(v) for v in cfg["tasks"]["value_range"]]
+    value_ratio = (task.value0 - value_low) / max(value_high - value_low, 1e-9)
+    value_bin = min(2, max(0, int(value_ratio * 3.0)))
+    urgency_bin = 0 if task.half_life_s <= 30 * 60 else (1 if task.half_life_s <= 120 * 60 else 2)
+    scale_choices = [float(v) for v in cfg["tasks"]["scale_choices_b"]]
+    scale_bin = int(np.argmin([abs(task.scale_b - v) for v in scale_choices]))
+    energy_fraction = energy_left / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+    energy_bin = min(3, max(0, int(energy_fraction * 4.0)))
+    bandwidth_fraction = scheduler.used_total / max(scheduler.capacity_total, 1.0)
+    bandwidth_bin = min(3, max(0, int(bandwidth_fraction * 4.0)))
+    backlog_ratio = max(0.0, compute_ready_s - task.arrival_s) / max(task.half_life_s, 1.0)
+    backlog_bin = 0 if backlog_ratio < 0.25 else (1 if backlog_ratio < 1.0 else 2)
+    return urgency_bin, value_bin, scale_bin, energy_bin, bandwidth_bin, backlog_bin
+
+
+def _drl_ua_state(
+    task: Task,
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+) -> tuple[int, ...]:
+    """Association-aware state: base resource state plus current contact reachability."""
+    base = _leo_learning_state(task, scheduler, compute_ready_s, energy_left, cfg)
+    next_contact_s = min(
+        (max(0.0, window.start_s - task.arrival_s) for window in scheduler.windows if window.end_s > task.arrival_s),
+        default=cfg["horizon_h"] * 3600.0,
+    )
+    contact_bin = 0 if next_contact_s <= 5 * 60 else (1 if next_contact_s <= 30 * 60 else 2)
+    return (*base, contact_bin)
+
+
+def choose_leo_drl_inspired(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> tuple[str, tuple[int, int, int, int, int, int]]:
+    """Discrete Q-learning adaptation trained only on separate synthetic seeds."""
+    state = _leo_learning_state(task, scheduler, compute_ready_s, energy_left, cfg)
+    q_table: dict[tuple[tuple[int, ...], str], float] = context.setdefault("q_table", {})
+    training = bool(context.get("training", False))
+    epsilon = float(context.get("epsilon", cfg.get("leo_drl", {}).get("epsilon", 0.10))) if training else 0.0
+    rng: np.random.Generator = context.setdefault("rng", np.random.default_rng(20260712))
+    feasible = [str(row["action"]) for row in _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre)]
+    if not feasible:
+        return "DOWN", state
+    if training and float(rng.random()) < epsilon:
+        return str(rng.choice(feasible)), state
+    ranked = sorted(((float(q_table.get((state, action), 0.0)), action) for action in feasible), key=lambda x: (x[0], x[1]), reverse=True)
+    if ranked and ranked[0][0] != 0.0:
+        return ranked[0][1], state
+    # Unseen states use an immediate resource-aware preference, then learn from it.
+    outcomes = {str(row["action"]): row for row in _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre)}
+    return max(
+        feasible,
+        key=lambda action: (
+            float(outcomes[action]["realized"]) / max(task.value0, 1e-9)
+            - 0.25 * float(outcomes[action]["delay_s"]) / max(task.half_life_s, 1.0)
+            - 0.15 * float(outcomes[action]["energy_j"]) / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+            - 0.10 * float(outcomes[action]["bits"]) / max(task.data_bits, 1.0)
+        ),
+    ), state
+
+
+def choose_drl_ua_inspired(
+    task: Task,
+    costs: dict[str, ActionCost],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    cfg: dict[str, Any],
+    context: dict[str, Any],
+    *,
+    allow_pre: bool = True,
+) -> tuple[str, tuple[int, ...]]:
+    """Association-aware Q-learning projection inspired by Zhang et al."""
+    state = _drl_ua_state(task, scheduler, compute_ready_s, energy_left, cfg)
+    q_table: dict[tuple[tuple[int, ...], str], float] = context.setdefault("q_table", {})
+    training = bool(context.get("training", False))
+    params = cfg.get("drl_ua", {})
+    epsilon = float(context.get("epsilon", params.get("epsilon", 0.15))) if training else 0.0
+    rng: np.random.Generator = context.setdefault("rng", np.random.default_rng(20260713))
+    outcomes = _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre)
+    feasible = [str(row["action"]) for row in outcomes]
+    if not feasible:
+        return "DOWN", state
+    if training and float(rng.random()) < epsilon:
+        return str(rng.choice(feasible)), state
+    ranked = sorted(((float(q_table.get((state, action), 0.0)), action) for action in feasible), key=lambda item: (item[0], item[1]), reverse=True)
+    if ranked and ranked[0][0] != 0.0:
+        return ranked[0][1], state
+    by_action = {str(row["action"]): row for row in outcomes}
+    return max(
+        feasible,
+        key=lambda action: (
+            float(by_action[action]["realized"]) / max(task.value0, 1e-9)
+            - 0.30 * float(by_action[action]["delay_s"]) / max(task.half_life_s, 1.0)
+            - 0.12 * float(by_action[action]["energy_j"]) / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+            - 0.16 * float(by_action[action]["bits"]) / max(task.data_bits, 1.0)
+        ),
+    ), state
+
+
 def solar_recharge_j(cfg: dict[str, Any], start_s: float, end_s: float) -> float:
     soc = cfg.get("soc", {})
     if end_s <= start_s:
@@ -508,6 +968,7 @@ def _simulate_action_sequence(
     scheduler: DownlinkScheduler,
     compute_ready_s: float,
     energy_left: float,
+    precomputed_costs: list[dict[str, ActionCost]] | None = None,
 ) -> float:
     sim_scheduler = scheduler.clone()
     sim_compute_ready = compute_ready_s
@@ -515,8 +976,8 @@ def _simulate_action_sequence(
     value = 0.0
     memory_limit = float(cfg["satellite"]["memory_gb"])
     ground_latency_s = float(cfg.get("ground", {}).get("latency_s", 0.0))
-    for action, task in zip(actions, tasks):
-        costs = task_costs(task, profile, cfg)
+    for task_idx, (action, task) in enumerate(zip(actions, tasks)):
+        costs = precomputed_costs[task_idx] if precomputed_costs is not None else task_costs(task, profile, cfg)
         if action in {"ON", "PRE"} and (costs[action].memory_gb > memory_limit or costs[action].energy_j > sim_energy_left):
             action = "DOWN"
         cost = costs[action]
@@ -558,6 +1019,85 @@ def choose_mpc(
     return best_action
 
 
+def choose_pbr_adapted(
+    tasks_window: list[Task],
+    windows: list[Window],
+    profile: pd.DataFrame,
+    cfg: dict[str, Any],
+    scheduler: DownlinkScheduler,
+    compute_ready_s: float,
+    energy_left: float,
+    *,
+    allow_pre: bool = True,
+) -> str:
+    """Bounded rounding/branch-and-bound projection of the JSA PBR method.
+
+    The original PBR paper addresses LEO task offloading.  This adaptation
+    orders branches with a continuous-style one-step utility relaxation and
+    prunes action prefixes using an optimistic remaining-value bound.  It is a
+    receding-horizon comparator under OrbitLLM's common action contract.
+    """
+    params = cfg.get("pbr", {})
+    lookahead = max(1, int(params.get("lookahead", 5)))
+    horizon_tasks = tasks_window[:lookahead]
+    if not horizon_tasks:
+        return "DOWN"
+    precomputed_costs = [task_costs(task, profile, cfg) for task in horizon_tasks]
+    branch_orders: list[list[str]] = []
+    for task, costs in zip(horizon_tasks, precomputed_costs):
+        rows = _candidate_outcomes(task, costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre)
+        scored = sorted(
+            (
+                float(row["realized"])
+                - float(params.get("energy_price", 0.15))
+                * float(row["energy_j"])
+                / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+                * task.value0
+                - float(params.get("bandwidth_price", 0.10))
+                * float(row["bits"])
+                / max(task.data_bits, 1.0)
+                * task.value0,
+                str(row["action"]),
+            )
+            for row in rows
+        )
+        ordered = [action for _, action in reversed(scored)]
+        branch_orders.append(ordered if ordered else ["DOWN"])
+
+    optimistic_tail = [0.0] * (len(horizon_tasks) + 1)
+    for idx in range(len(horizon_tasks) - 1, -1, -1):
+        optimistic_tail[idx] = optimistic_tail[idx + 1] + horizon_tasks[idx].value0
+
+    best_value = -1.0
+    best_action = "DOWN"
+
+    def search(prefix: tuple[str, ...], depth: int) -> None:
+        nonlocal best_value, best_action
+        prefix_value = _simulate_action_sequence(
+            prefix,
+            horizon_tasks[:depth],
+            windows,
+            profile,
+            cfg,
+            scheduler,
+            compute_ready_s,
+            energy_left,
+            precomputed_costs[:depth],
+        ) if prefix else 0.0
+        if prefix_value + optimistic_tail[depth] <= best_value + 1e-12:
+            return
+        if depth == len(horizon_tasks):
+            if prefix_value > best_value:
+                best_value = prefix_value
+                best_action = prefix[0]
+            return
+        for action in branch_orders[depth]:
+            search((*prefix, action), depth + 1)
+
+    search(tuple(), 0)
+    return best_action
+
+
 def run_policy(
     policy: str,
     tasks: list[Task],
@@ -569,6 +1109,7 @@ def run_policy(
     split_energy: bool = True,
     decision_tasks: list[Task] | None = None,
     energy_model: str = "static",
+    policy_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, float | str | int], pd.DataFrame]:
     horizon_s = cfg["horizon_h"] * 3600.0
     scheduler = DownlinkScheduler(windows, horizon_s)
@@ -600,6 +1141,12 @@ def run_policy(
     lambda_energy_trace: list[float] = []
     lambda_bandwidth_trace: list[float] = []
     decision_times_ms: list[float] = []
+    context = policy_context if policy_context is not None else {}
+    if policy == "DPP-LLM":
+        context.setdefault("energy_queue", 0.0)
+        context.setdefault("bandwidth_queue", 0.0)
+        context["energy_quota_j"] = battery_capacity / max(len(tasks), 1)
+        context["bandwidth_quota_bits"] = scheduler.capacity_total / max(len(tasks), 1)
 
     for task_idx, task in enumerate(tasks):
         if energy_model == "soc":
@@ -623,6 +1170,40 @@ def run_policy(
             action = choose_deadline_energy(task, costs, scheduler, compute_ready_s, energy_left, cfg)
         elif policy == "Energy-WSRPT":
             action = choose_energy_wsrpt(task, costs, scheduler, compute_ready_s, energy_left, cfg)
+        elif policy == "DPP-LLM":
+            action = choose_dpp_llm(task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, context, allow_pre=allow_pre)
+        elif policy == "ActiveInf-inspired":
+            action = choose_active_inf_inspired(task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre)
+        elif policy == "LEO-DRL-inspired":
+            action, learning_state = choose_leo_drl_inspired(
+                task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, context, allow_pre=allow_pre
+            )
+            context["learning_state"] = learning_state
+        elif policy == "DRL-UA-inspired":
+            action, learning_state = choose_drl_ua_inspired(
+                task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, context, allow_pre=allow_pre
+            )
+            context["learning_state"] = learning_state
+        elif policy == "Hierarchical-RA-inspired":
+            action = choose_hierarchical_ra_inspired(
+                task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre
+            )
+        elif policy == "QoS-Multihop-projected":
+            action = choose_qos_multihop_projected(
+                task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre
+            )
+        elif policy == "DelayCost-adapted":
+            action = choose_delay_cost_adapted(
+                task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre
+            )
+        elif policy == "EH-DORA-adapted":
+            action = choose_eh_dora_adapted(
+                task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre
+            )
+        elif policy == "PeakMem-inspired":
+            action = choose_peakmem_inspired(
+                task, decision_costs, scheduler, compute_ready_s, energy_left, cfg, allow_pre=allow_pre
+            )
         elif policy == "Heuristic-TVD":
             action = choose_heuristic(
                 task,
@@ -654,6 +1235,18 @@ def run_policy(
                 lookahead = int(cfg.get("mpc", {}).get("lookahead", 5))
             future_tasks = decision_tasks[task_idx:] if decision_tasks is not None else tasks[task_idx:]
             action = choose_mpc(future_tasks, windows, profile, cfg, scheduler, compute_ready_s, energy_left, lookahead)
+        elif policy == "PBR-adapted":
+            future_tasks = decision_tasks[task_idx:] if decision_tasks is not None else tasks[task_idx:]
+            action = choose_pbr_adapted(
+                future_tasks,
+                windows,
+                profile,
+                cfg,
+                scheduler,
+                compute_ready_s,
+                energy_left,
+                allow_pre=allow_pre,
+            )
         else:
             raise ValueError(f"unknown policy: {policy}")
         decision_times_ms.append((time.perf_counter() - t_decision) * 1000.0)
@@ -690,6 +1283,34 @@ def run_policy(
             completion = scheduler.schedule(task.arrival_s, cost.bits, commit=True) + ground_latency_s
             realized = value_at(task, completion)
         min_energy_left = min(min_energy_left, energy_left)
+
+        if policy == "DPP-LLM":
+            energy_load = cost.energy_j / max(float(context["energy_quota_j"]), 1.0) if action in {"ON", "PRE"} else 0.0
+            bandwidth_load = cost.bits / max(float(context["bandwidth_quota_bits"]), 1.0) if action in {"PRE", "DOWN"} else 0.0
+            context["energy_queue"] = max(0.0, float(context["energy_queue"]) + energy_load - 1.0)
+            context["bandwidth_queue"] = max(0.0, float(context["bandwidth_queue"]) + bandwidth_load - 1.0)
+
+        if policy in {"LEO-DRL-inspired", "DRL-UA-inspired"} and bool(context.get("training", False)):
+            state = context.get("learning_state")
+            if state is not None:
+                q_table = context.setdefault("q_table", {})
+                learning_cfg = cfg.get("drl_ua" if policy == "DRL-UA-inspired" else "leo_drl", {})
+                alpha = float(learning_cfg.get("alpha", 0.25))
+                gamma = float(learning_cfg.get("gamma", 0.90))
+                reward = (
+                    realized / max(task.value0, 1e-9)
+                    - 0.25 * max(0.0, completion - task.arrival_s) / max(task.half_life_s, 1.0)
+                    - 0.15 * cost.energy_j / max(float(cfg["satellite"]["energy_budget_j"]), 1.0)
+                    - 0.10 * cost.bits / max(task.data_bits, 1.0)
+                )
+                next_max = 0.0
+                if task_idx + 1 < len(tasks):
+                    state_fn = _drl_ua_state if policy == "DRL-UA-inspired" else _leo_learning_state
+                    next_state = state_fn(tasks[task_idx + 1], scheduler, compute_ready_s, energy_left, cfg)
+                    next_max = max(float(q_table.get((next_state, a), 0.0)) for a in ("ON", "PRE", "DOWN"))
+                key = (state, action)
+                old_q = float(q_table.get(key, 0.0))
+                q_table[key] = old_q + alpha * (reward + gamma * next_max - old_q)
 
         if policy == "Adaptive-TVD":
             progress = (task_idx + 1) / max(len(tasks), 1)
@@ -754,6 +1375,8 @@ def run_policy(
         "lambda_bandwidth_final": lambda_bandwidth_trace[-1] if lambda_bandwidth_trace else np.nan,
         "lambda_energy_mean": float(np.mean(lambda_energy_trace)) if lambda_energy_trace else np.nan,
         "lambda_bandwidth_mean": float(np.mean(lambda_bandwidth_trace)) if lambda_bandwidth_trace else np.nan,
+        "dpp_energy_queue_final": float(context.get("energy_queue", np.nan)),
+        "dpp_bandwidth_queue_final": float(context.get("bandwidth_queue", np.nan)),
     }
     return metrics, pd.DataFrame(events)
 
@@ -856,7 +1479,7 @@ def run_milp_bound(tasks: list[Task], windows: list[Window], profile: pd.DataFra
 def run_experiment(cfg: dict[str, Any], profile: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     metrics_rows: list[dict[str, float | str | int]] = []
     timeseries_rows: list[pd.DataFrame] = []
-    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Deadline-Energy", "Priority-Aware", "Heuristic-TVD"]
+    policies = ["All-Downlink", "All-On-Board", "Fixed-Threshold", "Deadline-Energy", "Priority-Aware", "Energy-WSRPT", "Heuristic-TVD"]
     for seed in cfg["seeds"]:
         tasks = generate_tasks(cfg, int(seed))
         windows = generate_windows(cfg)
@@ -1233,6 +1856,216 @@ def run_mpc_baselines(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFram
     return _normalize_by_group(pd.DataFrame(rows), ["seed"])
 
 
+SOTA_BASELINE_POLICIES = [
+    "Deadline-Energy",
+    "Energy-WSRPT",
+    "ActiveInf-inspired",
+    "LEO-DRL-inspired",
+    "Hierarchical-RA-inspired",
+    "DRL-UA-inspired",
+    "QoS-Multihop-projected",
+    "DelayCost-adapted",
+    "Heuristic-TVD",
+]
+
+
+def train_leo_drl_inspired(
+    cfg: dict[str, Any],
+    profile: pd.DataFrame,
+    *,
+    horizon_h: float | None = None,
+    task_limit: int | None = None,
+) -> dict[str, Any]:
+    """Train the tabular inspired baseline only on configured non-test seeds."""
+    params = cfg.get("leo_drl", {})
+    train_seeds = [int(seed) for seed in params.get("training_seeds", [])]
+    epochs = max(1, int(params.get("training_epochs", 1)))
+    context: dict[str, Any] = {
+        "training": True,
+        "epsilon": float(params.get("epsilon", 0.15)),
+        "q_table": {},
+        "rng": np.random.default_rng(20260712),
+        "training_seeds": tuple(train_seeds),
+    }
+    train_cfg = copy.deepcopy(cfg)
+    if horizon_h is not None:
+        train_cfg["horizon_h"] = float(horizon_h)
+    for _ in range(epochs):
+        for seed in train_seeds:
+            tasks = generate_tasks(train_cfg, seed, horizon_h=train_cfg["horizon_h"], limit=task_limit)
+            windows = generate_windows(train_cfg, horizon_h=train_cfg["horizon_h"])
+            run_policy("LEO-DRL-inspired", tasks, windows, profile, train_cfg, policy_context=context)
+    context["training"] = False
+    context["epsilon"] = 0.0
+    return context
+
+
+def train_drl_ua_inspired(
+    cfg: dict[str, Any],
+    profile: pd.DataFrame,
+    *,
+    horizon_h: float | None = None,
+    task_limit: int | None = None,
+) -> dict[str, Any]:
+    """Train the user-association-inspired learner only on disjoint seeds."""
+    params = cfg.get("drl_ua", {})
+    train_seeds = [int(seed) for seed in params.get("training_seeds", cfg.get("leo_drl", {}).get("training_seeds", []))]
+    context: dict[str, Any] = {
+        "training": True,
+        "epsilon": float(params.get("epsilon", 0.15)),
+        "q_table": {},
+        "rng": np.random.default_rng(20260714),
+        "training_seeds": tuple(train_seeds),
+    }
+    train_cfg = copy.deepcopy(cfg)
+    if horizon_h is not None:
+        train_cfg["horizon_h"] = float(horizon_h)
+    for _ in range(max(1, int(params.get("training_epochs", 4)))):
+        for seed in train_seeds:
+            tasks = generate_tasks(train_cfg, seed, horizon_h=train_cfg["horizon_h"], limit=task_limit)
+            windows = generate_windows(train_cfg, horizon_h=train_cfg["horizon_h"])
+            run_policy("DRL-UA-inspired", tasks, windows, profile, train_cfg, policy_context=context)
+    context["training"] = False
+    context["epsilon"] = 0.0
+    return context
+
+
+def run_sota_baseline_suite(
+    cfg: dict[str, Any],
+    profile: pd.DataFrame,
+    *,
+    seeds: list[int] | None = None,
+    horizon_h: float | None = None,
+    task_limit: int | None = None,
+    allow_pre: bool = True,
+    use_tle: bool = False,
+) -> pd.DataFrame:
+    """Evaluate recent-method-inspired policies under OrbitLLM's common constraints."""
+    eval_cfg = copy.deepcopy(cfg)
+    if horizon_h is not None:
+        eval_cfg["horizon_h"] = float(horizon_h)
+    eval_seeds = [int(seed) for seed in (seeds if seeds is not None else eval_cfg["seeds"])]
+    train_context = train_leo_drl_inspired(
+        eval_cfg, profile, horizon_h=eval_cfg["horizon_h"], task_limit=task_limit
+    )
+    ua_context = train_drl_ua_inspired(
+        eval_cfg, profile, horizon_h=eval_cfg["horizon_h"], task_limit=task_limit
+    )
+    shared_windows: list[Window] | None = None
+    if use_tle:
+        shared_windows, _ = generate_tle_windows(eval_cfg, horizon_h=eval_cfg["horizon_h"])
+    rows: list[dict[str, float | str | int]] = []
+    for seed in eval_seeds:
+        tasks = generate_tasks(eval_cfg, seed, horizon_h=eval_cfg["horizon_h"], limit=task_limit)
+        windows = shared_windows if shared_windows is not None else generate_windows(eval_cfg, horizon_h=eval_cfg["horizon_h"])
+        for policy in SOTA_BASELINE_POLICIES:
+            context = None
+            if policy == "LEO-DRL-inspired":
+                context = {"training": False, "epsilon": 0.0, "q_table": train_context["q_table"]}
+            elif policy == "DRL-UA-inspired":
+                context = {"training": False, "epsilon": 0.0, "q_table": ua_context["q_table"]}
+            metrics, _ = run_policy(
+                policy, tasks, windows, profile, eval_cfg, allow_pre=allow_pre, policy_context=context
+            )
+            metrics.update(
+                {
+                    "seed": seed,
+                    "horizon_h": eval_cfg["horizon_h"],
+                    "task_count": len(tasks),
+                    "allow_pre": int(allow_pre),
+                    "contact_model": "tle" if use_tle else "fixed-window",
+                    "training_seed_count": len(train_context["training_seeds"]),
+                    "training_q_states": len(train_context["q_table"]),
+                    "ua_training_seed_count": len(ua_context["training_seeds"]),
+                    "ua_training_q_states": len(ua_context["q_table"]),
+                }
+            )
+            rows.append(metrics)
+    return _normalize_by_group(pd.DataFrame(rows), ["seed", "contact_model", "allow_pre"])
+
+
+def run_sota_oracle_comparison(
+    cfg: dict[str, Any],
+    profile: pd.DataFrame,
+    *,
+    seeds: list[int] | None = None,
+    horizon_h: float = 3.0,
+    task_limit: int = 8,
+) -> pd.DataFrame:
+    """Compare online policies with exact action enumeration on small instances."""
+    oracle_cfg = copy.deepcopy(cfg)
+    oracle_cfg["horizon_h"] = float(horizon_h)
+    eval_seeds = [int(seed) for seed in (seeds if seeds is not None else oracle_cfg["seeds"])]
+    train_context = train_leo_drl_inspired(
+        oracle_cfg, profile, horizon_h=oracle_cfg["horizon_h"], task_limit=task_limit
+    )
+    ua_context = train_drl_ua_inspired(
+        oracle_cfg, profile, horizon_h=oracle_cfg["horizon_h"], task_limit=task_limit
+    )
+    rows: list[dict[str, float | str | int]] = []
+    for seed in eval_seeds:
+        tasks = generate_tasks(oracle_cfg, seed, horizon_h=oracle_cfg["horizon_h"], limit=task_limit)
+        windows = generate_windows(oracle_cfg, horizon_h=oracle_cfg["horizon_h"])
+        initial_scheduler = DownlinkScheduler(windows, oracle_cfg["horizon_h"] * 3600.0)
+        precomputed_costs = [task_costs(task, profile, oracle_cfg) for task in tasks]
+        oracle_value = max(
+            _simulate_action_sequence(
+                actions, tasks, windows, profile, oracle_cfg, initial_scheduler, 0.0,
+                float(oracle_cfg["satellite"]["energy_budget_j"]),
+                precomputed_costs,
+            )
+            for actions in itertools.product(("ON", "PRE", "DOWN"), repeat=len(tasks))
+        )
+        for policy in SOTA_BASELINE_POLICIES:
+            context = None
+            if policy == "LEO-DRL-inspired":
+                context = {"training": False, "epsilon": 0.0, "q_table": train_context["q_table"]}
+            elif policy == "DRL-UA-inspired":
+                context = {"training": False, "epsilon": 0.0, "q_table": ua_context["q_table"]}
+            metrics, _ = run_policy(policy, tasks, windows, profile, oracle_cfg, policy_context=context)
+            value = float(metrics["total_value"])
+            rows.append(
+                {
+                    "seed": seed,
+                    "policy": policy,
+                    "task_count": len(tasks),
+                    "oracle_value": oracle_value,
+                    "policy_value": value,
+                    "optimality_gap_pct": 100.0 * max(0.0, oracle_value - value) / max(oracle_value, 1e-9),
+                    "oom_count": metrics["oom_count"],
+                    "energy_violation_count": metrics["energy_violation_count"],
+                    "mean_decision_ms": metrics["mean_decision_ms"],
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def run_sota_baseline_timeseries(
+    cfg: dict[str, Any],
+    profile: pd.DataFrame,
+    *,
+    seeds: list[int] | None = None,
+) -> pd.DataFrame:
+    """Collect event traces for the main recent-baseline comparison."""
+    eval_seeds = [int(seed) for seed in (seeds if seeds is not None else cfg["seeds"])]
+    learned = train_leo_drl_inspired(cfg, profile)
+    ua_learned = train_drl_ua_inspired(cfg, profile)
+    frames: list[pd.DataFrame] = []
+    for seed in eval_seeds:
+        tasks = generate_tasks(cfg, seed)
+        windows = generate_windows(cfg)
+        for policy in SOTA_BASELINE_POLICIES:
+            context = None
+            if policy == "LEO-DRL-inspired":
+                context = {"training": False, "epsilon": 0.0, "q_table": learned["q_table"]}
+            elif policy == "DRL-UA-inspired":
+                context = {"training": False, "epsilon": 0.0, "q_table": ua_learned["q_table"]}
+            _, events = run_policy(policy, tasks, windows, profile, cfg, policy_context=context)
+            events["seed"] = seed
+            frames.append(events)
+    return pd.concat(frames, ignore_index=True)
+
+
 def run_soft_energy(cfg: dict[str, Any], profile: pd.DataFrame) -> pd.DataFrame:
     rows: list[dict[str, float | str | int]] = []
     soft_cfg = cfg.get("soft_energy", {})
@@ -1315,6 +2148,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--only-tle", action="store_true", help="Run only the fixed-window vs. TLE-derived contact trace check.")
     parser.add_argument("--iotj-required", action="store_true", help="Run IoT-J required supplemental simulation experiments.")
     parser.add_argument("--soft-energy", action="store_true", help="Run soft-energy penalty robustness experiment.")
+    parser.add_argument("--sota-baselines", action="store_true", help="Run recent-method-inspired local baseline suite.")
     args = parser.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -1328,6 +2162,14 @@ def main(argv: list[str] | None = None) -> int:
         out = resolve_project_path(cfg.get("soft_energy_path", "results/soft_energy_metrics.csv"))
         soft.to_csv(out, index=False)
         print(f"wrote {out}")
+    elif getattr(args, "sota_baselines", False):
+        df = run_sota_baseline_suite(cfg, profile)
+        out = resolve_project_path("results/sota_baseline_main_metrics.csv")
+        df.to_csv(out, index=False)
+        events = run_sota_baseline_timeseries(cfg, profile)
+        events_out = resolve_project_path("results/sota_baseline_timeseries.csv")
+        events.to_csv(events_out, index=False)
+        print(f"wrote {out} and {events_out}")
     elif getattr(args, "iotj_required", False):
         write_iotj_required_experiments(cfg, profile)
         print("wrote IoT-J required experiment CSVs")

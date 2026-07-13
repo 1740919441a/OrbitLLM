@@ -1,0 +1,2 @@
+backend,selector,images,rho,rho_std,accuracy,eta,pre_latency_ms_per_image,sam_wall_j_per_img,pre_energy_j_per_image,idle_w,peak_mem_gb,valid_mask_rate,seed
+mobile_sam,sam_top3,300,0.3195906575520833,0.36991461757659944,0.14666666666666667,0.3728813559322034,250.15730001963675,33.170740273552404,17.861303595545017,57.97460000000001,2.82312448,1.0,7

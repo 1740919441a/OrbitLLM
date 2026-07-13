@@ -1,0 +1,2 @@
+model,scale_b,modality,quant,image_size,context_len,prefill_tokens,decode_tokens,vision_prefill_j_per_image,prefill_j_per_tok,decode_j_per_tok,tokens_per_sec,peak_mem_gb,gpu_power_w,idle_power_w,seed,run_id
+/root/autodl-tmp/models/Qwen2.5-VL-3B-Instruct,3.0,image_text,FP16,224,25.73,1.0,24.73,8.151899025805163,8.151899025805163,3.5066626248017863,30.796708553891037,7.057296180725098,118.307325768742,52.18826666666664,0,vlm_4090_mean
